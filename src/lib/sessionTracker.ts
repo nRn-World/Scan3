@@ -66,6 +66,20 @@ function bboxCenter(bbox: [number, number, number, number]): [number, number] {
   return [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2];
 }
 
+function extractDigitCount(canonicalId: string): number {
+  const m = canonicalId.match(/\d+/);
+  return m ? m[0].length : 0;
+}
+
+function hammingDistanceSameLength(a: string, b: string): number {
+  if (a.length !== b.length) return 99;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) diff++;
+  }
+  return diff;
+}
+
 function getThresholds(mode: SensitivityMode): {
   fastPanAbsenceSec: number;
   normalAbsenceSec: number;
@@ -75,25 +89,25 @@ function getThresholds(mode: SensitivityMode): {
   switch (mode) {
     case "fast":
       return {
-        fastPanAbsenceSec: 0.35,
-        normalAbsenceSec: 0.65,
-        minSceneDelta: 5.5,
-        jumpDist: 0.32,
+        fastPanAbsenceSec: 0.3,
+        normalAbsenceSec: 0.55,
+        minSceneDelta: 5.0,
+        jumpDist: 0.3,
       };
     case "strict":
       return {
-        fastPanAbsenceSec: 0.95,
-        normalAbsenceSec: 1.65,
-        minSceneDelta: 9.5,
-        jumpDist: 0.44,
+        fastPanAbsenceSec: 0.9,
+        normalAbsenceSec: 1.55,
+        minSceneDelta: 9.2,
+        jumpDist: 0.42,
       };
     case "standard":
     default:
       return {
-        fastPanAbsenceSec: 0.5,
-        normalAbsenceSec: 0.9,
-        minSceneDelta: 6.8,
-        jumpDist: 0.36,
+        fastPanAbsenceSec: 0.45,
+        normalAbsenceSec: 0.8,
+        minSceneDelta: 6.2,
+        jumpDist: 0.34,
       };
   }
 }
@@ -214,7 +228,8 @@ export class InventorySessionTracker {
   public processFrame(
     frame: AnalyzeFrameResponse,
     timestampSec: number,
-    sensitivity: SensitivityMode
+    sensitivity: SensitivityMode,
+    defaultCustomer = ""
   ): FrameProcessOutcome {
     const {
       fastPanAbsenceSec,
@@ -230,19 +245,18 @@ export class InventorySessionTracker {
     this.prevFrameSig = sceneSig;
 
     for (const [cid, cand] of this.pendingOcr.entries()) {
-      if (timestampSec - cand.lastTs > 3.2) {
+      if (timestampSec - cand.lastTs > 3.5) {
         this.pendingOcr.delete(cid);
       }
     }
 
-    // Non-clipped visible canonical IDs in this frame
     const visibleCleanIds = new Set(
       frame.detections
         .filter((d) => !d.edge_clipped || d.source.startsWith("barcode"))
         .map((d) => d.canonical_id)
     );
 
-    // 1. Update absence & scene-change rearming for locked codes not cleanly visible
+    // 1. Update absence & scene-change rearming for locked codes
     for (const [cid, st] of this.trackStates.entries()) {
       if (!visibleCleanIds.has(cid)) {
         const deltaFromLock = computeSceneDelta(sceneSig, st.lockedSceneSig);
@@ -254,16 +268,16 @@ export class InventorySessionTracker {
         const absentFor = timestampSec - st.lastSeenSec;
 
         const rearmByInterveningCode =
-          st.otherCodeConfirmedSinceLock && absentFor >= 0.3;
+          st.otherCodeConfirmedSinceLock && absentFor >= 0.25;
         const rearmByFastPan =
           absentFor >= fastPanAbsenceSec &&
-          st.maxSceneDeltaWhileAbsent >= 18.0;
+          st.maxSceneDeltaWhileAbsent >= 16.5;
         const rearmByNormalPan =
           absentFor >= normalAbsenceSec &&
           st.maxSceneDeltaWhileAbsent >= minSceneDelta;
         const rearmByLongAbsence =
-          absentFor >= normalAbsenceSec * 2.1 &&
-          st.maxSceneDeltaWhileAbsent >= 3.8;
+          absentFor >= normalAbsenceSec * 2.0 &&
+          st.maxSceneDeltaWhileAbsent >= 3.5;
 
         if (
           st.status === "LOCKED" &&
@@ -278,7 +292,6 @@ export class InventorySessionTracker {
           }
         }
       } else {
-        // Even while visible in adjacent frames, if the label jumped across the screen during a big camera pan
         const matchingDet = frame.detections.find(
           (d) => d.canonical_id === cid && !d.edge_clipped
         );
@@ -288,21 +301,32 @@ export class InventorySessionTracker {
             cx - st.lastCenter[0],
             cy - st.lastCenter[1]
           );
-          if (dist >= jumpDist && stepDelta >= 22.0) {
+          if (dist >= jumpDist && stepDelta >= 20.0) {
             st.status = "REARMED";
           }
         }
       }
     }
 
-    // 2. Evaluate detections in current frame for multi-frame confirmation
+    // 2. Evaluate detections in current frame
     const confirmedDetections: FrameDetection[] = [];
     let verifyingCandidate: FrameDetection | null = null;
     let clippedWarning: FrameDetection | null = null;
 
+    // Filter out substrings if a longer superstring is already detected in the SAME frame
+    const frameIds = frame.detections.map((d) => d.canonical_id);
+
     for (const det of frame.detections) {
       if (det.customer && det.customer.trim()) {
         this.customerMemory.set(det.canonical_id, det.customer.trim());
+      }
+
+      if (
+        frameIds.some(
+          (other) => other !== det.canonical_id && other.includes(det.canonical_id)
+        )
+      ) {
+        continue;
       }
 
       if (det.edge_clipped && !det.source.startsWith("barcode")) {
@@ -316,7 +340,7 @@ export class InventorySessionTracker {
         continue;
       }
 
-      if (det.confidence < 0.78) {
+      if (det.confidence < 0.48) {
         continue;
       }
 
@@ -326,6 +350,63 @@ export class InventorySessionTracker {
         continue;
       }
 
+      // Check if camera is still motionless on an ALREADY LOCKED box:
+      // - Ignore shorter substring exit-blur (e.g., locked DEL0615244, exit frame reads DEL061524)
+      // - Ignore low-confidence 1-digit motion blur on the exact same spot
+      if (this.activeLockedId && this.activeLockedId !== det.canonical_id) {
+        const activeTrack = this.trackStates.get(this.activeLockedId);
+        if (activeTrack && activeTrack.status === "LOCKED") {
+          const deltaFromActive = computeSceneDelta(
+            sceneSig,
+            activeTrack.lockedSceneSig
+          );
+          const [cx, cy] = bboxCenter(det.bbox);
+          const distFromActive = Math.hypot(
+            cx - activeTrack.lastCenter[0],
+            cy - activeTrack.lastCenter[1]
+          );
+
+          if (deltaFromActive < 9.0 && distFromActive < 0.22) {
+            // Substring of already locked code on same motionless label -> ignore
+            if (this.activeLockedId.includes(det.canonical_id)) {
+              continue;
+            }
+            // Low-confidence 1-char OCR jitter on motionless label -> require higher confidence / 2nd frame
+            if (
+              hammingDistanceSameLength(this.activeLockedId, det.canonical_id) === 1 &&
+              det.confidence < 0.88
+            ) {
+              const pend = this.pendingOcr.get(det.canonical_id);
+              if (!pend || pend.sightings < 2) {
+                this.pendingOcr.set(det.canonical_id, {
+                  canonicalId: det.canonical_id,
+                  sightings: (pend?.sightings ?? 0) + 1,
+                  firstTs: pend?.firstTs ?? timestampSec,
+                  lastTs: timestampSec,
+                  bestDetection: det,
+                });
+                continue;
+              }
+            }
+          }
+        }
+      }
+
+      // Instant 1-frame lock for clean >= 6-digit DEL/REM labels (like `del0615244`) on mobile!
+      const digitCount = extractDigitCount(det.canonical_id);
+      const canInstantLock =
+        sensitivity !== "strict" &&
+        digitCount >= 6 &&
+        det.confidence >= 0.56 &&
+        !det.edge_clipped;
+
+      if (canInstantLock) {
+        confirmedDetections.push(det);
+        this.pendingOcr.delete(det.canonical_id);
+        continue;
+      }
+
+      // Multi-frame confirmation for short codes or strict mode
       const prevPend = this.pendingOcr.get(det.canonical_id);
       if (!prevPend) {
         this.pendingOcr.set(det.canonical_id, {
@@ -351,7 +432,7 @@ export class InventorySessionTracker {
             other !== det.canonical_id && other.includes(det.canonical_id)
         );
 
-        if (!hasSuperstringPending && prevPend.sightings >= 2 && dt >= 0.08) {
+        if (!hasSuperstringPending && prevPend.sightings >= 2 && dt >= 0.05) {
           confirmedDetections.push(det);
           this.pendingOcr.delete(det.canonical_id);
         } else {
@@ -368,13 +449,76 @@ export class InventorySessionTracker {
       const cid = det.canonical_id;
       const center = bboxCenter(det.bbox);
       const rememberedCustomer = this.customerMemory.get(cid) || "";
+      const fallbackCust = defaultCustomer.trim() || "Okänd kund";
       const resolvedCustomer =
         (det.customer && det.customer.trim()) ||
         rememberedCustomer ||
-        "Okänd kund";
+        fallbackCust;
 
       if (resolvedCustomer !== "Okänd kund") {
         this.customerMemory.set(cid, resolvedCustomer);
+      }
+
+      // Check for Same-Box Superstring Upgrade (e.g. Frame 1 locked DEL061524, Frame 2 on same motionless box sees DEL0615244)
+      if (
+        !this.rowsMap.has(cid) &&
+        this.activeLockedId &&
+        cid.includes(this.activeLockedId) &&
+        cid !== this.activeLockedId
+      ) {
+        const prevRow = this.rowsMap.get(this.activeLockedId);
+        const prevTrack = this.trackStates.get(this.activeLockedId);
+        if (prevRow && prevTrack && prevRow.count === 1) {
+          const deltaFromPrev = computeSceneDelta(
+            sceneSig,
+            prevTrack.lockedSceneSig
+          );
+          const distFromPrev = Math.hypot(
+            center[0] - prevTrack.lastCenter[0],
+            center[1] - prevTrack.lastCenter[1]
+          );
+          if (deltaFromPrev < 10.5 && distFromPrev < 0.25) {
+            const oldId = this.activeLockedId;
+            this.rowsMap.delete(oldId);
+            this.trackStates.delete(oldId);
+
+            const upgradedRow: InventoryRow = {
+              ...prevRow,
+              id: cid,
+              customer:
+                prevRow.customer !== "Okänd kund"
+                  ? prevRow.customer
+                  : resolvedCustomer,
+              category: det.category,
+              numberTitle: det.display_title,
+              numberUpper: det.display_upper,
+              verifiedBy: humanizeSource(det.source),
+              lastUpdatedTs: Date.now(),
+            };
+            this.rowsMap.set(cid, upgradedRow);
+            this.trackStates.set(cid, {
+              ...prevTrack,
+              lastSeenSec: timestampSec,
+              lastCenter: center,
+            });
+            this.activeLockedId = cid;
+            for (const u of this.undoStack) {
+              if (u.rowId === oldId) {
+                u.rowId = cid;
+                u.label = `${upgradedRow.customer} • ${det.display_title}`;
+              }
+            }
+            hudBanner = {
+              kind: "locked_new",
+              title: `Registrerad: ${det.display_title} (${det.category})`,
+              subtitle: `Kund: ${upgradedRow.customer} • Antal: 1 — flytta kameran till nästa etikett`,
+              canonicalId: cid,
+            };
+            this.lastHeldBanner = hudBanner;
+            this.lastBannerHoldUntilSec = timestampSec + 1.5;
+            continue;
+          }
+        }
       }
 
       const existingRow = this.rowsMap.get(cid);
@@ -426,12 +570,12 @@ export class InventorySessionTracker {
         outcomeEvent = "new_scan";
         hudBanner = {
           kind: "locked_new",
-          title: `Registrerad: Kund ${resolvedCustomer} • ${det.category}`,
-          subtitle: `${det.display_title} (Antal: 1) — flytta kameran till nästa paket`,
+          title: `✓ Registrerad: ${det.display_title} (${det.category})`,
+          subtitle: `Kund: ${resolvedCustomer} • Antal: 1 — flytta kameran till nästa etikett`,
           canonicalId: cid,
         };
         this.lastHeldBanner = hudBanner;
-        this.lastBannerHoldUntilSec = timestampSec + 1.4;
+        this.lastBannerHoldUntilSec = timestampSec + 1.6;
       } else if (track.status === "LOCKED") {
         track.lastSeenSec = timestampSec;
         track.lastCenter = center;
@@ -460,8 +604,8 @@ export class InventorySessionTracker {
         if (!hudBanner) {
           hudBanner = {
             kind: "locked_hold",
-            title: `Låst på låda: Kund ${existingRow.customer} • ${existingRow.category}`,
-            subtitle: `${existingRow.numberTitle} (Antal: ${existingRow.count}) — flytta kameran för nästa paket`,
+            title: `Låst på etikett: ${existingRow.numberTitle} (Antal: ${existingRow.count})`,
+            subtitle: `Kund: ${existingRow.customer} • Flytta kameran till nästa låda/etikett`,
             canonicalId: cid,
           };
         }
@@ -511,8 +655,8 @@ export class InventorySessionTracker {
         outcomeEvent = "duplicate_scan";
         hudBanner = {
           kind: "duplicate_added",
-          title: `+1 Likadant nummer räknat! → Antal: ${nextCount}`,
-          subtitle: `Kund ${existingRow.customer} • ${existingRow.category} • ${existingRow.numberTitle}`,
+          title: `✓ +1 Likadan etikett! ${existingRow.numberTitle} → Antal: ${nextCount}`,
+          subtitle: `Kund: ${existingRow.customer} • ${existingRow.category}`,
           canonicalId: cid,
         };
         this.lastHeldBanner = hudBanner;
@@ -529,22 +673,22 @@ export class InventorySessionTracker {
       } else if (verifyingCandidate) {
         hudBanner = {
           kind: "verifying",
-          title: `Verifierar: ${verifyingCandidate.customer ? `${verifyingCandidate.customer} • ${verifyingCandidate.display_title}` : verifyingCandidate.display_title}`,
-          subtitle: "Dubbelkollar nästa bildruta för 100% säker avläsning...",
+          title: `Läser: ${verifyingCandidate.display_title}...`,
+          subtitle: "Håll kameran stadigt ett ögonblick",
           canonicalId: verifyingCandidate.canonical_id,
         };
       } else if (clippedWarning) {
         hudBanner = {
           kind: "edge_warning",
           title: "Etiketten är nära bildkanten",
-          subtitle: "Håll hela numret innanför ramen så inget tecken kapas",
+          subtitle: "Centrera numret i gröna rutan så alla siffror syns",
         };
       } else {
         hudBanner = {
           kind: "idle",
-          title: "Redo för nästa paket",
+          title: "Spelar in & söker etiketter...",
           subtitle:
-            "Rikta kameran mot streckkod eller Delivery-/Removal-nummer",
+            "Rikta kameran mot del.../rem...-nummer eller streckkod",
         };
       }
     }

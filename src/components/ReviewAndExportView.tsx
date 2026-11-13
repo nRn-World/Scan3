@@ -14,6 +14,7 @@ import {
   Plus,
   RotateCcw,
   Search,
+  Share2,
   Trash2,
 } from "lucide-react";
 import { InventoryRow, PackageCategory } from "../types";
@@ -29,6 +30,7 @@ interface ReviewAndExportViewProps {
   onChangeAutoDownload: (val: boolean) => void;
   onUpdateRows: (updated: InventoryRow[]) => void;
   onDownloadExcel: () => Promise<void>;
+  onShareExcelMobile?: () => Promise<void>;
   onCopyForExcel: () => void;
   isDownloading: boolean;
   justFinishedVideo: boolean;
@@ -64,6 +66,7 @@ export const ReviewAndExportView: React.FC<ReviewAndExportViewProps> = ({
   onChangeAutoDownload,
   onUpdateRows,
   onDownloadExcel,
+  onShareExcelMobile,
   onCopyForExcel,
   isDownloading,
   justFinishedVideo,
@@ -283,6 +286,19 @@ export const ReviewAndExportView: React.FC<ReviewAndExportViewProps> = ({
               <Copy className="h-4 w-4" />
               Kopiera till Excel
             </button>
+
+            {onShareExcelMobile && (
+              <button
+                type="button"
+                onClick={onShareExcelMobile}
+                disabled={rows.length === 0 || isDownloading}
+                className="inline-flex items-center gap-2 rounded-xl bg-sky-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-50"
+                title="Öppnar mobilens meny för att spara i Filer, skicka via Mail, Teams eller WhatsApp"
+              >
+                <Share2 className="h-4 w-4" />
+                Dela / Spara i mobil
+              </button>
+            )}
 
             <button
               type="button"

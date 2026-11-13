@@ -4,14 +4,17 @@ import {
   Camera,
   CheckCircle2,
   Download,
+  Eye,
   FileSpreadsheet,
   Film,
   Flashlight,
+  Loader2,
   Play,
   Plus,
   QrCode,
   ScanLine,
   ShieldCheck,
+  Smartphone,
   Square,
   Undo2,
   Upload,
@@ -25,9 +28,12 @@ import {
   DEMO_TOTAL_DURATION_SEC,
   DemoWarehouseRenderer,
 } from "./lib/demoWarehouseRenderer";
+import { DEFAULT_CUSTOMERS_LIST } from "./lib/labelParser";
 import {
-  analyzeCanvasLocally,
-  DEFAULT_CUSTOMERS_LIST,
+  analyzeFrameLocally,
+  LocalEngineStatus,
+  subscribeLocalOcrStatus,
+  warmupLocalScanner,
 } from "./lib/localScannerFallback";
 import {
   formatSeconds,
@@ -46,6 +52,8 @@ import {
 type InputMode = "camera" | "upload" | "demo";
 type MainTab = "scan" | "review";
 
+const FOCUS_BOX: [number, number, number, number] = [0.06, 0.15, 0.94, 0.85];
+
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<MainTab>("scan");
   const [inputMode, setInputMode] = useState<InputMode>("camera");
@@ -59,7 +67,7 @@ export const App: React.FC = () => {
   const [activeLockedId, setActiveLockedId] = useState<string | null>(null);
   const [justFinishedVideo, setJustFinishedVideo] = useState(false);
 
-  // Scanner settings
+  // Scanner settings — autoDownloadOnStop is TRUE by default so stopping video saves Excel immediately!
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [sensitivity, setSensitivity] = useState<SensitivityMode>("standard");
   const [defaultCustomer, setDefaultCustomer] = useState("");
@@ -67,11 +75,13 @@ export const App: React.FC = () => {
     DEFAULT_CUSTOMERS_LIST
   );
   const backendAvailableRef = useRef<boolean | null>(null);
+  const [localOcrStatus, setLocalOcrStatus] =
+    useState<LocalEngineStatus>("idle");
   const [numberFormat, setNumberFormat] = useState<"title" | "upper">("title");
   const [columnMode, setColumnMode] = useState<
     "standard_4col" | "combined_category"
   >("standard_4col");
-  const [autoDownloadOnStop, setAutoDownloadOnStop] = useState(false);
+  const [autoDownloadOnStop, setAutoDownloadOnStop] = useState(true);
 
   // Modals & notifications
   const [showCustomersModal, setShowCustomersModal] = useState(false);
@@ -89,15 +99,19 @@ export const App: React.FC = () => {
   const [videoProgress, setVideoProgress] = useState(0);
   const [uploadPreviewSrc, setUploadPreviewSrc] = useState<string>("");
   const [liveDetections, setLiveDetections] = useState<FrameDetection[]>([]);
+  const [liveRawText, setLiveRawText] = useState<string>("");
+  const [scanFlash, setScanFlash] = useState<"none" | "new" | "dup">("none");
+  const [lastSavedLabel, setLastSavedLabel] = useState<string>("");
   const [sharpnessScore, setSharpnessScore] = useState<number>(0);
   const [hudBanner, setHudBanner] = useState<HudBannerState>({
     kind: "idle",
-    title: "Redo att filma paket",
+    title: "Redo att spela in & skanna etiketter",
     subtitle:
-      "Starta kameran, ladda upp en video eller testa med exempelvideon",
+      "Läser del.../rem...-nummer (t.ex. del0615244), streckkoder och kundnamn direkt i mobilen",
   });
 
   // Refs for media & loops
+  const viewfinderRef = useRef<HTMLDivElement | null>(null);
   const videoElRef = useRef<HTMLVideoElement | null>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const demoCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -123,11 +137,14 @@ export const App: React.FC = () => {
     setToastMessage(msg);
     window.setTimeout(() => {
       setToastMessage((prev) => (prev === msg ? null : prev));
-    }, 3200);
+    }, 3600);
   }, []);
 
-  // Load saved customer dictionary on mount (graceful fallback if standalone/offline)
+  // Load saved customer dictionary & pre-warm local WASM OCR engine on mount
   useEffect(() => {
+    const unsub = subscribeLocalOcrStatus((st) => setLocalOcrStatus(st));
+    warmupLocalScanner();
+
     try {
       const savedLocal = window.localStorage?.getItem("lagerscan_customers");
       if (savedLocal) {
@@ -154,6 +171,10 @@ export const App: React.FC = () => {
       .catch(() => {
         backendAvailableRef.current = false;
       });
+
+    return () => {
+      unsub();
+    };
   }, []);
 
   const handleSaveCustomers = async (updated: string[]) => {
@@ -181,7 +202,7 @@ export const App: React.FC = () => {
         }
       }
     } catch {
-      // saved locally in memory
+      // saved locally
     }
     triggerToast(`Sparade kundlista (${updated.length} kunder)`);
   };
@@ -234,94 +255,105 @@ export const App: React.FC = () => {
         .writeText(tsv)
         .then(() =>
           triggerToast(
-            "Tabellen kopierad! Öppna Excel och tryck Ctrl+V för att klistra in."
+            "Tabellen kopierad! Öppna Excel och klistra in direkt."
           )
         )
         .catch(() => {
           fallbackCopy();
-          triggerToast(
-            "Tabellen kopierad! Öppna Excel och tryck Ctrl+V för att klistra in."
-          );
+          triggerToast("Tabellen kopierad!");
         });
     } else {
       fallbackCopy();
-      triggerToast(
-        "Tabellen kopierad! Öppna Excel och tryck Ctrl+V för att klistra in."
-      );
+      triggerToast("Tabellen kopierad!");
     }
   }, [columnMode, numberFormat, rows, triggerToast]);
 
+  const generateExcelFilePayload = useCallback(
+    async (
+      targetRows: InventoryRow[]
+    ): Promise<{ blob: Blob; filename: string }> => {
+      const mappedItems = targetRows.map((r) => ({
+        customer: r.customer?.trim() || "Okänd kund",
+        category: r.category,
+        number:
+          numberFormat === "upper"
+            ? r.numberUpper || r.id
+            : r.numberTitle || r.id,
+        count: r.count,
+        first_seen: r.firstSeen,
+        verified_by: r.verifiedBy,
+      }));
+
+      let blob: Blob | null = null;
+
+      if (backendAvailableRef.current !== false) {
+        try {
+          const res = await fetch("/api/export-excel", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              items: mappedItems,
+              number_format: numberFormat,
+              column_mode: columnMode,
+              include_metadata: false,
+              session_title: "Videoinventering",
+            }),
+          });
+          if (res.ok) {
+            blob = await res.blob();
+          }
+        } catch {
+          backendAvailableRef.current = false;
+        }
+      }
+
+      if (!blob) {
+        const xlsxBytes = buildInventoryXlsxClientBytes(
+          mappedItems.map((m) => ({
+            customer: m.customer,
+            category: m.category,
+            number: m.number,
+            count: m.count,
+          })),
+          columnMode
+        );
+        blob = new Blob([xlsxBytes.buffer as ArrayBuffer], {
+          type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        });
+      }
+
+      const now = new Date();
+      const stamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(
+        2,
+        "0"
+      )}-${String(now.getDate()).padStart(2, "0")}_${String(
+        now.getHours()
+      ).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}`;
+      const filename = `Inventering_${stamp}.xlsx`;
+      return { blob, filename };
+    },
+    [columnMode, numberFormat]
+  );
+
   const downloadExcelForRows = useCallback(
     async (targetRows: InventoryRow[]) => {
-      if (targetRows.length === 0) return;
+      if (targetRows.length === 0) {
+        triggerToast("Inga paket att spara ännu.");
+        return;
+      }
       setIsDownloading(true);
       try {
-        const mappedItems = targetRows.map((r) => ({
-          customer: r.customer?.trim() || "Okänd kund",
-          category: r.category,
-          number:
-            numberFormat === "upper"
-              ? r.numberUpper || r.id
-              : r.numberTitle || r.id,
-          count: r.count,
-          first_seen: r.firstSeen,
-          verified_by: r.verifiedBy,
-        }));
-
-        let blob: Blob | null = null;
-
-        if (backendAvailableRef.current !== false) {
-          try {
-            const res = await fetch("/api/export-excel", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                items: mappedItems,
-                number_format: numberFormat,
-                column_mode: columnMode,
-                include_metadata: false,
-                session_title: "Videoinventering",
-              }),
-            });
-            if (res.ok) {
-              blob = await res.blob();
-            }
-          } catch {
-            backendAvailableRef.current = false;
-          }
-        }
-
-        if (!blob) {
-          // Pure client-side .xlsx generation (works 100% offline & standalone!)
-          const xlsxBytes = buildInventoryXlsxClientBytes(
-            mappedItems.map((m) => ({
-              customer: m.customer,
-              category: m.category,
-              number: m.number,
-              count: m.count,
-            })),
-            columnMode
-          );
-          blob = new Blob([xlsxBytes.buffer as ArrayBuffer], {
-            type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-          });
-        }
-
+        const { blob, filename } = await generateExcelFilePayload(targetRows);
         const url = URL.createObjectURL(blob);
-        const now = new Date();
-        const stamp = `${now.getFullYear()}-${String(
-          now.getMonth() + 1
-        ).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}_${String(
-          now.getHours()
-        ).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}`;
         const a = document.createElement("a");
         a.href = url;
-        a.download = `Inventering_${stamp}.xlsx`;
+        a.download = filename;
+        a.rel = "noopener";
         document.body.appendChild(a);
         a.click();
         a.remove();
-        window.setTimeout(() => URL.revokeObjectURL(url), 3000);
-        triggerToast("Excel-filen (.xlsx) är skapad!");
+        window.setTimeout(() => URL.revokeObjectURL(url), 12000);
+        triggerToast(`Excel-fil sparad: ${filename}`);
       } catch (err) {
         triggerToast(
           err instanceof Error ? err.message : "Fel vid export till Excel"
@@ -330,14 +362,46 @@ export const App: React.FC = () => {
         setIsDownloading(false);
       }
     },
-    [columnMode, numberFormat, triggerToast]
+    [generateExcelFilePayload, triggerToast]
   );
+
+  // Native iOS Safari / Android Share Sheet ("Spara i Filer", Mail, Teams, WhatsApp)
+  const shareExcelOnMobile = useCallback(async () => {
+    if (rows.length === 0) return;
+    setIsDownloading(true);
+    try {
+      const { blob, filename } = await generateExcelFilePayload(rows);
+      const file = new File([blob], filename, {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      });
+      const nav = navigator as Navigator & {
+        canShare?: (data?: ShareData) => boolean;
+      };
+      if (nav.share && (!nav.canShare || nav.canShare({ files: [file] }))) {
+        await nav.share({
+          title: filename,
+          text: `Lagerinventering (${rows.reduce((s, r) => s + r.count, 0)} paket)`,
+          files: [file],
+        });
+        triggerToast("Excel-fil delad/sparad!");
+      } else {
+        await downloadExcelForRows(rows);
+      }
+    } catch (err) {
+      if ((err as Error)?.name !== "AbortError") {
+        await downloadExcelForRows(rows);
+      }
+    } finally {
+      setIsDownloading(false);
+    }
+  }, [downloadExcelForRows, generateExcelFilePayload, rows, triggerToast]);
 
   // Stop all media streams cleanly
   const stopAllStreamsOnly = useCallback(() => {
     isFilmingRef.current = false;
     setIsFilming(false);
     setLiveDetections([]);
+    setLiveRawText("");
     setTorchOn(false);
     setTorchSupported(false);
 
@@ -364,27 +428,44 @@ export const App: React.FC = () => {
     };
   }, [stopAllStreamsOnly]);
 
-  // Called when user closes video OR when uploaded/demo video finishes
+  // Called when user stops video OR when uploaded/demo video finishes
   const finishVideoAndOpenReview = useCallback(() => {
     stopAllStreamsOnly();
     const latestRows = trackerRef.current.getRows();
     setRows(latestRows);
     setJustFinishedVideo(true);
     setActiveTab("review");
-    if (autoDownloadRef.current && latestRows.length > 0) {
-      downloadExcelForRows(latestRows);
+    if (latestRows.length > 0) {
+      if (autoDownloadRef.current) {
+        downloadExcelForRows(latestRows);
+      }
+    } else {
+      triggerToast(
+        "Inga del.../rem...-nummer registrerades i videon. Håll etiketten i gröna rutan tills det piper grönt!"
+      );
     }
-  }, [downloadExcelForRows, stopAllStreamsOnly]);
+  }, [downloadExcelForRows, stopAllStreamsOnly, triggerToast]);
 
   const applyAnalyzedFrame = useCallback(
     (analysis: AnalyzeFrameResponse, tsSec: number) => {
       setSharpnessScore(analysis.sharpness || 0);
       setLiveDetections(analysis.detections || []);
+      if (analysis.raw_text_preview) {
+        setLiveRawText(analysis.raw_text_preview);
+      } else if (analysis.ocr_regions && analysis.ocr_regions.length > 0) {
+        setLiveRawText(
+          analysis.ocr_regions
+            .slice(0, 3)
+            .map((r) => r.text)
+            .join(" · ")
+        );
+      }
 
       const outcome = trackerRef.current.processFrame(
         analysis,
         tsSec,
-        sensitivityRef.current
+        sensitivityRef.current,
+        defaultCustomerRef.current
       );
 
       setRows(outcome.rows);
@@ -394,24 +475,96 @@ export const App: React.FC = () => {
 
       if (outcome.event === "new_scan") {
         soundEngine.playNewScan(soundEnabledRef.current);
+        try {
+          navigator.vibrate?.(70);
+        } catch {
+          // ignore
+        }
+        const topRow = outcome.rows[0];
+        if (topRow) {
+          setLastSavedLabel(
+            `${topRow.numberTitle} (${topRow.count} st)`
+          );
+        }
+        setScanFlash("new");
+        window.setTimeout(() => setScanFlash("none"), 500);
       } else if (outcome.event === "duplicate_scan") {
         soundEngine.playDuplicateScan(soundEnabledRef.current);
+        try {
+          navigator.vibrate?.([60, 50, 80]);
+        } catch {
+          // ignore
+        }
+        const topRow = outcome.rows[0];
+        if (topRow) {
+          setLastSavedLabel(
+            `+1 ${topRow.numberTitle} (${topRow.count} st)`
+          );
+        }
+        setScanFlash("dup");
+        window.setTimeout(() => setScanFlash("none"), 550);
       }
     },
     []
   );
 
+  /**
+   * Draws `<video>` onto `canvas` using the exact `object-cover` crop displayed
+   * inside `viewfinderRef` so mobile portrait cameras stay high-resolution and
+   * bounding boxes align 1:1 with what the user sees on screen.
+   */
+  const drawVideoObjectCoverToCanvas = (
+    vid: HTMLVideoElement,
+    canvas: HTMLCanvasElement
+  ): boolean => {
+    const vw = vid.videoWidth;
+    const vh = vid.videoHeight;
+    if (!vw || !vh) return false;
+
+    const vf = viewfinderRef.current;
+    const boxAspect =
+      vf && vf.clientWidth > 0 && vf.clientHeight > 0
+        ? vf.clientWidth / vf.clientHeight
+        : 4 / 3;
+    const vidAspect = vw / vh;
+
+    let sx = 0;
+    let sy = 0;
+    let sw = vw;
+    let sh = vh;
+
+    if (vidAspect > boxAspect) {
+      sw = Math.round(vh * boxAspect);
+      sx = Math.round((vw - sw) / 2);
+    } else {
+      sh = Math.round(vw / boxAspect);
+      sy = Math.round((vh - sh) / 2);
+    }
+
+    const maxTargetW = 1024;
+    const scale = sw > maxTargetW ? maxTargetW / sw : 1.0;
+    canvas.width = Math.max(320, Math.round(sw * scale));
+    canvas.height = Math.max(240, Math.round(sh * scale));
+
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return false;
+    ctx.drawImage(vid, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+    return true;
+  };
+
   // -------------------------------------------------------------------------
-  // MODE 1: LIVE CAMERA (Mobile rear camera or webcam)
+  // MODE 1: LIVE CAMERA (Mobile rear camera with continuous autofocus + OCR)
   // -------------------------------------------------------------------------
   const startLiveCamera = async () => {
     soundEngine.unlock();
+    warmupLocalScanner();
     setCameraError(null);
     stopAllStreamsOnly();
+    setInputMode("camera");
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setCameraError(
-        "Kameran är inte tillgänglig i denna vy (kräver HTTPS eller direkt webbläsarflik). Du kan ladda upp en inspelad video eller köra demovideon!"
+        "Direktkameran kunde inte startas i denna vy. Använd knappen 'Filma med mobilens kameraapp' nedan eller öppna sidan via HTTPS!"
       );
       return;
     }
@@ -420,20 +573,34 @@ export const App: React.FC = () => {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: { ideal: "environment" },
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
         },
         audio: false,
       });
 
       mediaStreamRef.current = stream;
       const track = stream.getVideoTracks()[0];
-      if (track && "getCapabilities" in track) {
-        const caps = track.getCapabilities() as MediaTrackCapabilities & {
-          torch?: boolean;
-        };
-        if (caps && caps.torch) {
-          setTorchSupported(true);
+      if (track) {
+        if ("getCapabilities" in track) {
+          const caps = track.getCapabilities() as MediaTrackCapabilities & {
+            torch?: boolean;
+            focusMode?: string[];
+          };
+          if (caps?.torch) {
+            setTorchSupported(true);
+          }
+          if (caps?.focusMode && caps.focusMode.includes("continuous")) {
+            try {
+              await track.applyConstraints({
+                advanced: [
+                  { focusMode: "continuous" } as unknown as MediaTrackConstraintSet,
+                ],
+              });
+            } catch {
+              // autofocus already managed by OS
+            }
+          }
         }
       }
 
@@ -449,12 +616,11 @@ export const App: React.FC = () => {
       setElapsedSec(0);
       setHudBanner({
         kind: "idle",
-        title: "Kameran är igång – filma dina paket",
+        title: "● SPELAR IN – Håll etiketten i gröna rutan",
         subtitle:
-          "Rikta mot streckkod eller Delivery/Removal-nummer. När du stänger videon skapas listan.",
+          "Läser t.ex. del0615244 och streckkoder automatiskt. Tryck Stoppa för att spara Excel!",
       });
 
-      // Async non-blocking frame analysis loop
       const runCameraLoop = async () => {
         while (isFilmingRef.current && videoElRef.current) {
           const vid = videoElRef.current;
@@ -465,18 +631,12 @@ export const App: React.FC = () => {
             const canvas =
               captureCanvasRef.current || document.createElement("canvas");
             captureCanvasRef.current = canvas;
-            const maxW = 860;
-            const scale =
-              vid.videoWidth > maxW ? maxW / vid.videoWidth : 1.0;
-            canvas.width = Math.round(vid.videoWidth * scale);
-            canvas.height = Math.round(vid.videoHeight * scale);
-            const ctx = canvas.getContext("2d");
-            if (ctx) {
-              ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
+
+            if (drawVideoObjectCoverToCanvas(vid, canvas)) {
               let handledByBackend = false;
               if (backendAvailableRef.current !== false) {
                 try {
-                  const dataUrl = canvas.toDataURL("image/jpeg", 0.78);
+                  const dataUrl = canvas.toDataURL("image/jpeg", 0.82);
                   const res = await fetch("/api/analyze-frame", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
@@ -499,25 +659,27 @@ export const App: React.FC = () => {
               }
 
               if (!handledByBackend && isFilmingRef.current) {
-                const localData = await analyzeCanvasLocally(
+                const localData = await analyzeFrameLocally(
                   canvas,
                   knownCustomersRef.current,
-                  defaultCustomerRef.current
+                  FOCUS_BOX
                 );
-                const frameTs =
-                  (performance.now() - startTimeMsRef.current) / 1000;
-                applyAnalyzedFrame(localData, frameTs);
+                if (isFilmingRef.current) {
+                  const frameTs =
+                    (performance.now() - startTimeMsRef.current) / 1000;
+                  applyAnalyzedFrame(localData, frameTs);
+                }
               }
             }
           }
-          await new Promise((r) => setTimeout(r, 90));
+          await new Promise((r) => setTimeout(r, 60));
         }
       };
 
       runCameraLoop();
-    } catch (err) {
+    } catch {
       setCameraError(
-        "Kunde inte öppna kameran (behörighet nekad eller ingen kamera hittades). Öppna länken i mobilens webbläsare, ladda upp en videofil eller prova demovideon!"
+        "Kunde inte öppna direktkameran (kontrollera kameratillstånd eller använd 'Filma med mobilens kameraapp' här nedanför!)."
       );
       stopAllStreamsOnly();
     }
@@ -531,16 +693,16 @@ export const App: React.FC = () => {
     const next = !torchOn;
     try {
       await track.applyConstraints({
-        advanced: [{ torch: next } as MediaTrackConstraintSet],
+        advanced: [{ torch: next } as unknown as MediaTrackConstraintSet],
       });
       setTorchOn(next);
     } catch {
-      triggerToast("Kunde inte växla ficklampa på denna enhet.");
+      triggerToast("Kunde inte växla blixt på denna enhet.");
     }
   };
 
   // -------------------------------------------------------------------------
-  // MODE 2: UPLOAD RECORDED VIDEO (.mp4 / .mov / .webm)
+  // MODE 2: RECORD WITH NATIVE PHONE CAMERA OR UPLOAD VIDEO (.mp4 / .mov)
   // -------------------------------------------------------------------------
   const handleVideoFileSelected = async (
     e: React.ChangeEvent<HTMLInputElement>
@@ -550,6 +712,7 @@ export const App: React.FC = () => {
     e.target.value = "";
 
     soundEngine.unlock();
+    warmupLocalScanner();
     stopAllStreamsOnly();
     setInputMode("upload");
     setJustFinishedVideo(false);
@@ -560,9 +723,9 @@ export const App: React.FC = () => {
     setVideoDurationSec(0);
     setHudBanner({
       kind: "verifying",
-      title: `Läser av video: ${file.name}`,
+      title: `Läser av inspelad video (${file.name})`,
       subtitle:
-        "Analyserar alla streckkoder, kundnamn och Delivery/Removal-nummer...",
+        "Skannar alla etiketter (t.ex. del0615244) och sparar Excel-fil när videon är klar...",
     });
 
     const controller = new AbortController();
@@ -573,49 +736,90 @@ export const App: React.FC = () => {
       const tempVid = document.createElement("video");
       tempVid.muted = true;
       tempVid.playsInline = true;
+      tempVid.setAttribute("playsinline", "true");
       tempVid.preload = "auto";
       tempVid.src = objUrl;
+      tempVid.load();
 
       try {
         await new Promise<void>((resolve, reject) => {
-          tempVid.onloadedmetadata = () => resolve();
-          tempVid.onerror = () =>
-            reject(new Error("Webbläsaren kunde inte spela upp videofilen."));
+          const timeout = window.setTimeout(() => resolve(), 3500);
+          tempVid.onloadeddata = () => {
+            window.clearTimeout(timeout);
+            resolve();
+          };
+          tempVid.onloadedmetadata = () => {
+            // Prime iOS Safari video decoder
+            tempVid
+              .play()
+              .then(() => {
+                tempVid.pause();
+                tempVid.currentTime = 0;
+                window.clearTimeout(timeout);
+                resolve();
+              })
+              .catch(() => {
+                window.clearTimeout(timeout);
+                resolve();
+              });
+          };
+          tempVid.onerror = () => {
+            window.clearTimeout(timeout);
+            reject(new Error("Webbläsaren kunde inte öppna videofilen."));
+          };
         });
 
-        const dur = Number.isFinite(tempVid.duration) ? tempVid.duration : 0;
+        const dur =
+          Number.isFinite(tempVid.duration) && tempVid.duration > 0
+            ? tempVid.duration
+            : 0;
         setVideoDurationSec(dur);
-        const step = 0.3;
-        const offCanvas = document.createElement("canvas");
-        const maxW = 800;
-        const scale = tempVid.videoWidth > maxW ? maxW / tempVid.videoWidth : 1;
-        offCanvas.width = Math.max(320, Math.round(tempVid.videoWidth * scale));
-        offCanvas.height = Math.max(
-          240,
-          Math.round(tempVid.videoHeight * scale)
-        );
-        const octx = offCanvas.getContext("2d");
 
-        for (let t = 0; t <= dur && isFilmingRef.current; t += step) {
-          tempVid.currentTime = t;
+        const step = 0.28;
+        const offCanvas = document.createElement("canvas");
+        const maxSide = 1080;
+        const vw = Math.max(320, tempVid.videoWidth || 720);
+        const vh = Math.max(240, tempVid.videoHeight || 1280);
+        const scale = Math.max(vw, vh) > maxSide ? maxSide / Math.max(vw, vh) : 1;
+        offCanvas.width = Math.round(vw * scale);
+        offCanvas.height = Math.round(vh * scale);
+        const octx = offCanvas.getContext("2d", { willReadFrequently: true });
+
+        const maxT = dur > 0 ? dur : 0.1;
+        for (let t = 0.05; t <= maxT && isFilmingRef.current; t += step) {
           await new Promise<void>((resolve) => {
-            tempVid.onseeked = () => resolve();
-            window.setTimeout(resolve, 400);
+            let done = false;
+            const finish = () => {
+              if (!done) {
+                done = true;
+                resolve();
+              }
+            };
+            tempVid.onseeked = finish;
+            window.setTimeout(finish, 450);
+            try {
+              tempVid.currentTime = Math.min(t, Math.max(0, dur - 0.02));
+            } catch {
+              finish();
+            }
           });
+
           if (!isFilmingRef.current) break;
           if (octx) {
             octx.drawImage(tempVid, 0, 0, offCanvas.width, offCanvas.height);
             setUploadPreviewSrc(offCanvas.toDataURL("image/jpeg", 0.72));
             setElapsedSec(t);
             setVideoProgress(dur > 0 ? Math.min(0.99, t / dur) : 0.5);
-            const localRes = await analyzeCanvasLocally(
+
+            // Scan full recorded frame so labels anywhere in the video are caught!
+            const localRes = await analyzeFrameLocally(
               offCanvas,
               knownCustomersRef.current,
-              defaultCustomerRef.current
+              [0.02, 0.05, 0.98, 0.95]
             );
             applyAnalyzedFrame(localRes, t);
           }
-          await new Promise((r) => setTimeout(r, 30));
+          await new Promise((r) => setTimeout(r, 20));
         }
 
         if (isFilmingRef.current) {
@@ -635,7 +839,7 @@ export const App: React.FC = () => {
 
       const form = new FormData();
       form.append("video", file);
-      form.append("sample_interval_sec", "0.30");
+      form.append("sample_interval_sec", "0.28");
       form.append("default_customer", defaultCustomerRef.current);
       form.append(
         "known_customers_json",
@@ -657,7 +861,9 @@ export const App: React.FC = () => {
       }
 
       if (!res.ok || !res.body) {
-        throw new Error("Kunde inte analysera videofilen.");
+        backendAvailableRef.current = false;
+        await runLocalVideoFallback(file);
+        return;
       }
 
       const reader = res.body.getReader();
@@ -712,10 +918,11 @@ export const App: React.FC = () => {
   };
 
   // -------------------------------------------------------------------------
-  // MODE 3: REALISTIC SIMULATED WAREHOUSE VIDEO (Uses real /api/analyze-frame!)
+  // MODE 3: DEMO WAREHOUSE VIDEO (Works both online & 100% offline on GitHub Pages!)
   // -------------------------------------------------------------------------
   const startDemoWarehouseVideo = async () => {
     soundEngine.unlock();
+    warmupLocalScanner();
     stopAllStreamsOnly();
     setInputMode("demo");
     setJustFinishedVideo(false);
@@ -730,7 +937,6 @@ export const App: React.FC = () => {
     setVideoProgress(0);
     startTimeMsRef.current = performance.now();
 
-    // 30fps smooth canvas animation loop
     const renderTick = () => {
       if (!isFilmingRef.current) return;
       const elapsed = (performance.now() - startTimeMsRef.current) / 1000;
@@ -753,7 +959,6 @@ export const App: React.FC = () => {
     };
     demoRafRef.current = requestAnimationFrame(renderTick);
 
-    // Real backend OCR + Barcode analysis loop reading the live canvas stream!
     const analyzeDemoLoop = async () => {
       while (isFilmingRef.current) {
         const canvas = demoCanvasRef.current;
@@ -761,23 +966,45 @@ export const App: React.FC = () => {
         if (elapsed >= DEMO_TOTAL_DURATION_SEC) break;
 
         if (canvas) {
-          const jpgUrl = canvas.toDataURL("image/jpeg", 0.82);
-          try {
-            const res = await fetch("/api/analyze-frame", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                image_base64: jpgUrl,
-                known_customers: knownCustomersRef.current,
-                default_customer: defaultCustomerRef.current,
-              }),
-            });
-            if (res.ok && isFilmingRef.current) {
-              const data: AnalyzeFrameResponse = await res.json();
-              applyAnalyzedFrame(data, elapsed);
+          let handled = false;
+          if (backendAvailableRef.current !== false) {
+            try {
+              const jpgUrl = canvas.toDataURL("image/jpeg", 0.82);
+              const res = await fetch("/api/analyze-frame", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  image_base64: jpgUrl,
+                  known_customers: knownCustomersRef.current,
+                  default_customer: defaultCustomerRef.current,
+                }),
+              });
+              if (res.ok && isFilmingRef.current) {
+                const data: AnalyzeFrameResponse = await res.json();
+                applyAnalyzedFrame(data, elapsed);
+                handled = true;
+              }
+            } catch {
+              backendAvailableRef.current = false;
             }
-          } catch {
-            // ignore
+          }
+
+          if (!handled && isFilmingRef.current) {
+            const snapCanvas = document.createElement("canvas");
+            snapCanvas.width = canvas.width;
+            snapCanvas.height = canvas.height;
+            const sctx = snapCanvas.getContext("2d");
+            if (sctx) {
+              sctx.drawImage(canvas, 0, 0);
+              const localData = await analyzeFrameLocally(
+                snapCanvas,
+                knownCustomersRef.current,
+                [0.02, 0.04, 0.98, 0.96]
+              );
+              if (isFilmingRef.current) {
+                applyAnalyzedFrame(localData, elapsed);
+              }
+            }
           }
         }
         await new Promise((r) => setTimeout(r, 95));
@@ -824,11 +1051,12 @@ export const App: React.FC = () => {
     setActiveLockedId(null);
     setJustFinishedVideo(false);
     setUploadPreviewSrc("");
+    setLastSavedLabel("");
     setActiveTab("scan");
     setHudBanner({
       kind: "idle",
       title: "Ny inventering redo",
-      subtitle: "Starta kameran eller ladda upp en video",
+      subtitle: "Starta kameran eller spela in en video av dina etiketter",
     });
   };
 
@@ -844,17 +1072,16 @@ export const App: React.FC = () => {
     return { total, del, rem, unique: rows.length };
   }, [rows]);
 
-  // HUD Banner Styling
   const hudColorClass = useMemo(() => {
     switch (hudBanner.kind) {
       case "locked_new":
-        return "border-emerald-400/80 bg-emerald-950/90 text-emerald-50";
+        return "border-emerald-400 bg-emerald-950/95 text-emerald-50";
       case "locked_hold":
-        return "border-emerald-500/50 bg-slate-900/90 text-emerald-100";
+        return "border-emerald-500/60 bg-slate-900/90 text-emerald-100";
       case "duplicate_added":
         return "border-sky-400 bg-sky-950/95 text-sky-50";
       case "verifying":
-        return "border-amber-400/70 bg-slate-900/90 text-amber-100";
+        return "border-amber-400/80 bg-slate-900/90 text-amber-100";
       case "edge_warning":
         return "border-rose-400/80 bg-rose-950/90 text-rose-100";
       default:
@@ -866,16 +1093,15 @@ export const App: React.FC = () => {
     <div className="min-h-screen bg-slate-50 text-slate-900">
       {/* Toast Notification */}
       {toastMessage && (
-        <div className="fixed bottom-5 right-5 z-50 flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-900 px-4 py-2.5 text-xs font-semibold text-white shadow-xl">
-          <CheckCircle2 className="h-4 w-4 text-emerald-400" />
-          {toastMessage}
+        <div className="fixed bottom-5 left-4 right-4 z-50 mx-auto flex max-w-md items-center gap-2 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 text-xs font-semibold text-white shadow-xl sm:left-auto sm:right-5">
+          <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-400" />
+          <span>{toastMessage}</span>
         </div>
       )}
 
       {/* Top Header Bar */}
       <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/95 backdrop-blur-sm">
-        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-3 sm:px-6">
-          {/* Brand */}
+        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-2.5 px-3.5 py-2.5 sm:px-6 sm:py-3">
           <div className="flex items-center gap-2.5">
             <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-slate-900 text-emerald-400 shadow-sm">
               <ScanLine className="h-5 w-5" />
@@ -885,12 +1111,12 @@ export const App: React.FC = () => {
                 <span className="text-base font-bold tracking-tight text-slate-900">
                   LagerScan
                 </span>
-                <span className="hidden rounded-md bg-emerald-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-emerald-700 sm:inline-block">
-                  Video → Excel
+                <span className="rounded-md bg-emerald-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-emerald-700">
+                  Mobil OCR + Excel
                 </span>
               </div>
-              <p className="text-[11px] text-slate-500">
-                Automatisk Delivery &amp; Removal-inventering per kund
+              <p className="hidden text-[11px] text-slate-500 sm:block">
+                Filma del.../rem...-etiketter (t.ex. del0615244) → automatisk Excel-fil
               </p>
             </div>
           </div>
@@ -900,14 +1126,14 @@ export const App: React.FC = () => {
             <button
               type="button"
               onClick={() => setActiveTab("scan")}
-              className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-semibold transition ${
+              className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
                 activeTab === "scan"
                   ? "bg-white text-slate-900 shadow-sm"
                   : "text-slate-600 hover:text-slate-900"
               }`}
             >
               <Camera className="h-3.5 w-3.5" />
-              1. Filma paket
+              1. Filma
             </button>
             <button
               type="button"
@@ -918,14 +1144,14 @@ export const App: React.FC = () => {
                   setActiveTab("review");
                 }
               }}
-              className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-semibold transition ${
+              className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
                 activeTab === "review"
                   ? "bg-white text-slate-900 shadow-sm"
                   : "text-slate-600 hover:text-slate-900"
               }`}
             >
               <FileSpreadsheet className="h-3.5 w-3.5" />
-              2. Lista &amp; Excel
+              2. Excel-lista
               {liveStats.total > 0 && (
                 <span className="rounded-full bg-emerald-600 px-1.5 py-0.5 text-[10px] font-bold text-white tabular-nums">
                   {liveStats.total}
@@ -935,12 +1161,12 @@ export const App: React.FC = () => {
           </nav>
 
           {/* Utility Actions */}
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5">
             <button
               type="button"
               onClick={() => setShowTestLabelsModal(true)}
               className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
-              title="Visa testetiketter att filma med mobilen"
+              title="Visa testetiketter (inkl. del0615244)"
             >
               <QrCode className="h-3.5 w-3.5 text-emerald-600" />
               <span className="hidden md:inline">Testetiketter</span>
@@ -952,14 +1178,14 @@ export const App: React.FC = () => {
               title="Hantera kända kunder"
             >
               <Building2 className="h-3.5 w-3.5 text-slate-500" />
-              <span>Kunder ({knownCustomers.length})</span>
+              <span>Kunder</span>
             </button>
           </div>
         </div>
       </header>
 
       {/* Main Content Container */}
-      <main className="mx-auto max-w-7xl px-4 py-5 sm:px-6">
+      <main className="mx-auto max-w-7xl px-3.5 py-4 sm:px-6 sm:py-5">
         {activeTab === "review" ? (
           <ReviewAndExportView
             rows={rows}
@@ -972,6 +1198,7 @@ export const App: React.FC = () => {
             onChangeAutoDownload={setAutoDownloadOnStop}
             onUpdateRows={handleUpdateRowsFromReview}
             onDownloadExcel={() => downloadExcelForRows(rows)}
+            onShareExcelMobile={shareExcelOnMobile}
             onCopyForExcel={copyRowsForExcel}
             isDownloading={isDownloading}
             justFinishedVideo={justFinishedVideo}
@@ -979,11 +1206,11 @@ export const App: React.FC = () => {
             onResetSession={handleResetAll}
           />
         ) : (
-          <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
             {/* LEFT COLUMN: Video Viewfinder + Controls (7 cols) */}
-            <div className="space-y-4 lg:col-span-7">
-              {/* Input Mode Selector Bar */}
-              <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
+            <div className="space-y-3.5 lg:col-span-7">
+              {/* Mode & Engine Status Bar */}
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-slate-200 bg-white p-2.5 shadow-sm sm:p-3">
                 <div className="flex flex-wrap items-center gap-1.5">
                   <button
                     type="button"
@@ -999,8 +1226,21 @@ export const App: React.FC = () => {
                     }`}
                   >
                     <Camera className="h-3.5 w-3.5" />
-                    Mobil-/Webbkamera
+                    Livekamera
                   </button>
+
+                  {/* Native Smartphone Camera Video Recorder (autofocus macro + 1080p) */}
+                  <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-900 ring-1 ring-sky-200 transition hover:bg-sky-100">
+                    <Smartphone className="h-3.5 w-3.5 text-sky-600" />
+                    Filma med kameraapp
+                    <input
+                      type="file"
+                      accept="video/*"
+                      capture="environment"
+                      onChange={handleVideoFileSelected}
+                      className="hidden"
+                    />
+                  </label>
 
                   <label
                     className={`inline-flex cursor-pointer items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-semibold transition ${
@@ -1010,7 +1250,7 @@ export const App: React.FC = () => {
                     }`}
                   >
                     <Upload className="h-3.5 w-3.5" />
-                    Ladda upp video
+                    Välj video
                     <input
                       type="file"
                       accept="video/*"
@@ -1029,51 +1269,80 @@ export const App: React.FC = () => {
                     }`}
                   >
                     <Play className="h-3.5 w-3.5" />
-                    Kör exempelvideo (6 paket)
+                    Demo
                   </button>
                 </div>
 
-                {/* Audio toggle */}
-                <button
-                  type="button"
-                  onClick={() => setSoundEnabled((s) => !s)}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
-                  title="Ljudbekräftelse (pip) vid registrerat paket"
-                >
-                  {soundEnabled ? (
-                    <>
+                <div className="flex items-center gap-2">
+                  {/* OCR Readiness Pill */}
+                  <span
+                    className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                      localOcrStatus === "ready" || backendAvailableRef.current
+                        ? "bg-emerald-50 text-emerald-800 ring-1 ring-emerald-200"
+                        : localOcrStatus === "loading"
+                          ? "bg-amber-50 text-amber-800 ring-1 ring-amber-200"
+                          : "bg-slate-100 text-slate-600"
+                    }`}
+                  >
+                    {localOcrStatus === "loading" && !backendAvailableRef.current ? (
+                      <>
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        Laddar OCR...
+                      </>
+                    ) : (
+                      <>
+                        <CheckCircle2 className="h-3 w-3 text-emerald-600" />
+                        OCR &amp; Streckkod redo
+                      </>
+                    )}
+                  </span>
+
+                  <button
+                    type="button"
+                    onClick={() => setSoundEnabled((s) => !s)}
+                    className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
+                    title="Ljudbekräftelse (pip) vid registrerat paket"
+                  >
+                    {soundEnabled ? (
                       <Volume2 className="h-3.5 w-3.5 text-emerald-600" />
-                      Pip på
-                    </>
-                  ) : (
-                    <>
+                    ) : (
                       <VolumeX className="h-3.5 w-3.5 text-slate-400" />
-                      Ljud av
-                    </>
-                  )}
-                </button>
+                    )}
+                  </button>
+                </div>
               </div>
 
-              {/* Viewfinder Viewport */}
+              {/* Viewfinder Card */}
               <div className="relative overflow-hidden rounded-2xl border border-slate-800 bg-slate-950 shadow-lg">
-                {/* Top HUD Status Banner */}
-                <div className="relative z-20 p-3">
+                {/* Green/Blue Flash Overlay when a package is registered */}
+                {scanFlash !== "none" && (
                   <div
-                    className={`flex items-center justify-between gap-3 rounded-xl border px-3.5 py-2.5 backdrop-blur-md transition ${hudColorClass}`}
+                    className={`pointer-events-none absolute inset-0 z-30 border-4 transition-opacity ${
+                      scanFlash === "new"
+                        ? "border-emerald-400 bg-emerald-400/20"
+                        : "border-sky-400 bg-sky-400/20"
+                    }`}
+                  />
+                )}
+
+                {/* Top HUD Status Banner */}
+                <div className="relative z-20 p-2.5 sm:p-3">
+                  <div
+                    className={`flex items-center justify-between gap-2.5 rounded-xl border px-3 py-2 backdrop-blur-md transition ${hudColorClass}`}
                   >
                     <div className="min-w-0">
                       <div className="truncate text-xs font-bold sm:text-sm">
                         {hudBanner.title}
                       </div>
-                      <div className="truncate text-[11px] opacity-85">
+                      <div className="truncate text-[11px] opacity-90">
                         {hudBanner.subtitle}
                       </div>
                     </div>
                     {isFilming && (
-                      <div className="flex shrink-0 items-center gap-2">
-                        <span className="inline-flex items-center gap-1.5 rounded-full bg-rose-600/90 px-2.5 py-1 font-mono text-[11px] font-bold text-white tabular-nums">
-                          <span className="h-2 w-2 animate-pulse rounded-full bg-white" />
-                          {formatSeconds(elapsedSec)}
+                      <div className="flex shrink-0 items-center gap-1.5">
+                        <span className="inline-flex items-center gap-1.5 rounded-full bg-rose-600 px-2.5 py-1 font-mono text-[11px] font-bold text-white shadow-sm tabular-nums">
+                          <span className="h-2 w-2 animate-ping rounded-full bg-white" />
+                          REC {formatSeconds(elapsedSec)}
                           {videoDurationSec > 0
                             ? ` / ${formatSeconds(videoDurationSec)}`
                             : ""}
@@ -1084,7 +1353,10 @@ export const App: React.FC = () => {
                 </div>
 
                 {/* Video / Canvas Surface */}
-                <div className="relative aspect-[4/3] w-full bg-slate-950 sm:aspect-[16/10]">
+                <div
+                  ref={viewfinderRef}
+                  className="relative aspect-[4/3] w-full bg-slate-950 sm:aspect-[16/10]"
+                >
                   {/* Live Camera Element */}
                   <video
                     ref={videoElRef}
@@ -1095,7 +1367,7 @@ export const App: React.FC = () => {
                     }`}
                   />
 
-                  {/* Uploaded Video Stream Preview */}
+                  {/* Uploaded / Recorded Video Stream Preview */}
                   {inputMode === "upload" && uploadPreviewSrc && (
                     <img
                       src={uploadPreviewSrc}
@@ -1116,24 +1388,27 @@ export const App: React.FC = () => {
 
                   {/* Idle / Start Overlay when not filming */}
                   {!isFilming && (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center px-6 text-center">
+                    <div className="absolute inset-0 flex flex-col items-center justify-center px-5 text-center">
                       {cameraError ? (
                         <div className="max-w-md rounded-2xl border border-amber-500/40 bg-slate-900/95 p-5 text-left">
                           <p className="text-xs leading-relaxed text-amber-200">
                             {cameraError}
                           </p>
                           <div className="mt-4 flex flex-wrap gap-2">
-                            <button
-                              type="button"
-                              onClick={startDemoWarehouseVideo}
-                              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-emerald-500"
-                            >
-                              <Play className="h-3.5 w-3.5" />
-                              Kör exempelvideo nu
-                            </button>
-                            <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-slate-600 bg-slate-800 px-3.5 py-2 text-xs font-semibold text-slate-100 hover:bg-slate-700">
+                            <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl bg-emerald-500 px-4 py-2.5 text-xs font-bold text-slate-950 hover:bg-emerald-400">
+                              <Smartphone className="h-4 w-4" />
+                              Filma med mobilens kameraapp
+                              <input
+                                type="file"
+                                accept="video/*"
+                                capture="environment"
+                                onChange={handleVideoFileSelected}
+                                className="hidden"
+                              />
+                            </label>
+                            <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl border border-slate-600 bg-slate-800 px-3.5 py-2.5 text-xs font-semibold text-slate-100 hover:bg-slate-700">
                               <Upload className="h-3.5 w-3.5" />
-                              Välj videofil
+                              Välj sparad video
                               <input
                                 type="file"
                                 accept="video/*"
@@ -1144,61 +1419,129 @@ export const App: React.FC = () => {
                           </div>
                         </div>
                       ) : inputMode === "upload" ? (
-                        <label className="flex max-w-sm cursor-pointer flex-col items-center rounded-2xl border-2 border-dashed border-slate-700 bg-slate-900/70 px-8 py-8 transition hover:border-emerald-500/70 hover:bg-slate-900">
-                          <Film className="h-10 w-10 text-emerald-400" />
-                          <span className="mt-3 text-sm font-bold text-white">
-                            Välj inspelad videofil (.mp4 / .mov)
-                          </span>
-                          <span className="mt-1 text-xs text-slate-400">
-                            Filma alla paket i en följd med mobilkameran och
-                            ladda upp videon här – listan skapas automatiskt
-                          </span>
-                          <input
-                            type="file"
-                            accept="video/*"
-                            onChange={handleVideoFileSelected}
-                            className="hidden"
-                          />
-                        </label>
+                        <div className="flex max-w-sm flex-col items-center gap-3 rounded-2xl border border-slate-700 bg-slate-900/85 p-6">
+                          <Film className="h-9 w-9 text-emerald-400" />
+                          <div className="text-sm font-bold text-white">
+                            Spela in eller välj en video av etiketterna
+                          </div>
+                          <p className="text-xs text-slate-400">
+                            Filma alla etiketter (t.ex.{" "}
+                            <span className="font-mono text-emerald-300">
+                              del0615244
+                            </span>
+                            ) i en följd – appen läser varje etikett och skapar
+                            Excel-filen automatiskt!
+                          </p>
+                          <div className="mt-1 flex flex-wrap justify-center gap-2">
+                            <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl bg-emerald-500 px-4 py-2.5 text-xs font-bold text-slate-950 hover:bg-emerald-400">
+                              <Smartphone className="h-4 w-4" />
+                              Spela in med kameraapp
+                              <input
+                                type="file"
+                                accept="video/*"
+                                capture="environment"
+                                onChange={handleVideoFileSelected}
+                                className="hidden"
+                              />
+                            </label>
+                            <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-slate-600 bg-slate-800 px-4 py-2.5 text-xs font-semibold text-white hover:bg-slate-700">
+                              <Upload className="h-4 w-4" />
+                              Välj från galleri
+                              <input
+                                type="file"
+                                accept="video/*"
+                                onChange={handleVideoFileSelected}
+                                className="hidden"
+                              />
+                            </label>
+                          </div>
+                        </div>
                       ) : (
                         <div className="flex flex-col items-center">
                           <button
                             type="button"
                             onClick={startLiveCamera}
-                            className="group inline-flex items-center gap-2.5 rounded-2xl bg-emerald-500 px-6 py-3.5 text-sm font-bold text-slate-950 shadow-lg shadow-emerald-500/20 transition hover:bg-emerald-400"
+                            className="group inline-flex items-center gap-2.5 rounded-2xl bg-emerald-500 px-6 py-4 text-sm font-extrabold text-slate-950 shadow-lg shadow-emerald-500/25 transition hover:bg-emerald-400"
                           >
-                            <Camera className="h-5 w-5" />
-                            Starta filmning (Kamera)
+                            <span className="h-3 w-3 rounded-full bg-rose-600 ring-2 ring-white" />
+                            Starta inspelning &amp; skanning (Kamera)
                           </button>
-                          <p className="mt-3 max-w-sm text-xs text-slate-400">
-                            Eller klicka på{" "}
-                            <button
-                              type="button"
-                              onClick={startDemoWarehouseVideo}
-                              className="font-semibold text-emerald-400 underline hover:text-emerald-300"
-                            >
-                              Kör exempelvideo (6 paket)
-                            </button>{" "}
-                            för att se hur dubbletter (t.ex. 2 st{" "}
+
+                          <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
+                            <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl border border-slate-700 bg-slate-900/90 px-3.5 py-2 text-xs font-semibold text-sky-300 hover:bg-slate-800">
+                              <Smartphone className="h-3.5 w-3.5" />
+                              Eller filma med mobilens kameraapp (skarp närbild)
+                              <input
+                                type="file"
+                                accept="video/*"
+                                capture="environment"
+                                onChange={handleVideoFileSelected}
+                                className="hidden"
+                              />
+                            </label>
+                          </div>
+
+                          <p className="mt-3 max-w-sm text-[11px] text-slate-400">
+                            Läser både streckkoder och utskrivna nummer som{" "}
+                            <span className="font-mono font-semibold text-emerald-300">
+                              del0615244
+                            </span>
+                            ,{" "}
                             <span className="font-mono text-slate-300">
                               Del001234567
+                            </span>{" "}
+                            och{" "}
+                            <span className="font-mono text-amber-300">
+                              rem...
                             </span>
-                            ) räknas och blir till en Excel-fil!
+                            . När du trycker Stoppa sparas Excel-filen direkt!
                           </p>
                         </div>
                       )}
                     </div>
                   )}
 
-                  {/* Active Viewfinder Reticle & Live Detection Bounding Boxes */}
+                  {/* Active Viewfinder Reticle, Live Counter Pill & Bounding Boxes */}
                   {isFilming && (
                     <div className="pointer-events-none absolute inset-0">
-                      {/* Subtle framing guide corners */}
-                      <div className="absolute inset-x-[8%] inset-y-[10%] rounded-2xl border border-white/15">
-                        <div className="absolute -left-0.5 -top-0.5 h-5 w-5 rounded-tl-lg border-l-2 border-t-2 border-emerald-400/80" />
-                        <div className="absolute -right-0.5 -top-0.5 h-5 w-5 rounded-tr-lg border-r-2 border-t-2 border-emerald-400/80" />
-                        <div className="absolute -bottom-0.5 -left-0.5 h-5 w-5 rounded-bl-lg border-b-2 border-l-2 border-emerald-400/80" />
-                        <div className="absolute -bottom-0.5 -right-0.5 h-5 w-5 rounded-br-lg border-b-2 border-r-2 border-emerald-400/80" />
+                      {/* Green Target Scan Box matching FOCUS_BOX */}
+                      <div
+                        style={{
+                          left: `${FOCUS_BOX[0] * 100}%`,
+                          top: `${FOCUS_BOX[1] * 100}%`,
+                          width: `${(FOCUS_BOX[2] - FOCUS_BOX[0]) * 100}%`,
+                          height: `${(FOCUS_BOX[3] - FOCUS_BOX[1]) * 100}%`,
+                        }}
+                        className="absolute rounded-2xl border border-emerald-400/45 shadow-[0_0_0_9999px_rgba(2,6,23,0.28)]"
+                      >
+                        <div className="absolute -left-0.5 -top-0.5 h-6 w-6 rounded-tl-xl border-l-4 border-t-4 border-emerald-400" />
+                        <div className="absolute -right-0.5 -top-0.5 h-6 w-6 rounded-tr-xl border-r-4 border-t-4 border-emerald-400" />
+                        <div className="absolute -bottom-0.5 -left-0.5 h-6 w-6 rounded-bl-xl border-b-4 border-l-4 border-emerald-400" />
+                        <div className="absolute -bottom-0.5 -right-0.5 h-6 w-6 rounded-br-xl border-b-4 border-r-4 border-emerald-400" />
+                      </div>
+
+                      {/* On-Screen Floating Counter Pill (Always visible on mobile without scrolling!) */}
+                      <div className="absolute bottom-9 left-3 right-3 flex flex-wrap items-center justify-between gap-2">
+                        <div className="inline-flex items-center gap-2 rounded-xl border border-slate-700/90 bg-slate-950/90 px-3 py-1.5 text-xs font-bold text-white shadow-lg backdrop-blur-sm">
+                          <span className="rounded-md bg-emerald-500 px-1.5 py-0.5 text-[11px] font-extrabold text-slate-950 tabular-nums">
+                            {liveStats.total} st
+                          </span>
+                          <span className="truncate">
+                            {lastSavedLabel
+                              ? `Senast: ${lastSavedLabel}`
+                              : "Håll etikett i rutan..."}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Live OCR Text Monitor Strip at very bottom of viewfinder */}
+                      <div className="absolute inset-x-0 bottom-0 flex items-center gap-1.5 bg-slate-950/85 px-3 py-1 text-[11px] text-slate-300 backdrop-blur-sm">
+                        <Eye className="h-3 w-3 shrink-0 text-emerald-400" />
+                        <span className="truncate font-mono">
+                          {liveRawText
+                            ? `Kamera läser: ${liveRawText}`
+                            : "Söker text/streckkod i bild..."}
+                        </span>
                       </div>
 
                       {/* Real-time Bounding Boxes around Detected Numbers/Barcodes */}
@@ -1211,15 +1554,15 @@ export const App: React.FC = () => {
                             style={{
                               left: `${x1 * 100}%`,
                               top: `${y1 * 100}%`,
-                              width: `${Math.max(6, (x2 - x1) * 100)}%`,
-                              height: `${Math.max(6, (y2 - y1) * 100)}%`,
+                              width: `${Math.max(8, (x2 - x1) * 100)}%`,
+                              height: `${Math.max(7, (y2 - y1) * 100)}%`,
                             }}
                             className={`absolute rounded-lg border-2 transition-all duration-100 ${
                               det.edge_clipped
                                 ? "border-dashed border-amber-400 bg-amber-400/10"
                                 : isDel
-                                  ? "border-emerald-400 bg-emerald-400/15 shadow-[0_0_16px_rgba(16,185,129,0.35)]"
-                                  : "border-amber-400 bg-amber-400/15 shadow-[0_0_16px_rgba(245,158,11,0.35)]"
+                                  ? "border-emerald-400 bg-emerald-400/20 shadow-[0_0_16px_rgba(16,185,129,0.45)]"
+                                  : "border-amber-400 bg-amber-400/20 shadow-[0_0_16px_rgba(245,158,11,0.45)]"
                             }`}
                           >
                             <div
@@ -1230,8 +1573,8 @@ export const App: React.FC = () => {
                               }`}
                             >
                               <span>
-                                {det.customer || "Läser kund..."} •{" "}
-                                {det.category} • {det.display_title}
+                                {det.display_title} ({det.category})
+                                {det.customer ? ` • ${det.customer}` : ""}
                               </span>
                             </div>
                           </div>
@@ -1255,24 +1598,24 @@ export const App: React.FC = () => {
                   )}
 
                 {/* Bottom Action Controls inside Scanner Card */}
-                <div className="flex flex-wrap items-center justify-between gap-2.5 border-t border-slate-800 bg-slate-900 px-4 py-3">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-800 bg-slate-900 px-3.5 py-3 sm:px-4">
                   {isFilming ? (
                     <>
                       <button
                         type="button"
                         onClick={finishVideoAndOpenReview}
-                        className="inline-flex items-center gap-2 rounded-xl bg-rose-600 px-4 py-2.5 text-xs font-bold text-white shadow-sm transition hover:bg-rose-500 sm:text-sm"
+                        className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-rose-600 px-4 py-3 text-xs font-extrabold text-white shadow-sm transition hover:bg-rose-500 sm:flex-none sm:text-sm"
                       >
                         <Square className="h-4 w-4 fill-current" />
-                        Stäng video &amp; Skapa Excel ({liveStats.total} paket)
+                        Stoppa &amp; Spara Excel ({liveStats.total} paket)
                       </button>
 
-                      <div className="flex flex-wrap items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-1.5">
                         {torchSupported && inputMode === "camera" && (
                           <button
                             type="button"
                             onClick={toggleTorch}
-                            className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-semibold ${
+                            className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-2 text-xs font-semibold ${
                               torchOn
                                 ? "bg-amber-400 text-slate-950"
                                 : "bg-slate-800 text-slate-200 hover:bg-slate-700"
@@ -1287,18 +1630,18 @@ export const App: React.FC = () => {
                           type="button"
                           disabled={rows.length === 0}
                           onClick={handleManualPlusOne}
-                          className="inline-flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-100 hover:bg-slate-700 disabled:opacity-40"
-                          title="Lägg manuellt till +1 på senaste låsta nummer om två lådor står tätt ihop"
+                          className="inline-flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-800 px-2.5 py-2 text-xs font-semibold text-slate-100 hover:bg-slate-700 disabled:opacity-40"
+                          title="Lägg manuellt till +1 på senaste låsta nummer"
                         >
                           <Plus className="h-3.5 w-3.5 text-sky-400" />
-                          +1 Samma nr
+                          +1
                         </button>
 
                         <button
                           type="button"
                           disabled={!canUndo}
                           onClick={handleUndoLast}
-                          className="inline-flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-700 disabled:opacity-40"
+                          className="inline-flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-800 px-2.5 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-700 disabled:opacity-40"
                         >
                           <Undo2 className="h-3.5 w-3.5" />
                           Ångra
@@ -1309,7 +1652,7 @@ export const App: React.FC = () => {
                     <div className="flex w-full flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
                       <span className="inline-flex items-center gap-1.5">
                         <ShieldCheck className="h-4 w-4 text-emerald-400" />
-                        Dubbelkontrollerad avläsning (Streckkod + OCR)
+                        Auto-sparar .xlsx när du stoppar inspelningen
                       </span>
                       {sharpnessScore > 0 && (
                         <span className="font-mono text-[11px] text-slate-500">
@@ -1321,68 +1664,109 @@ export const App: React.FC = () => {
                 </div>
               </div>
 
-              {/* Precision Settings Strip beneath Scanner */}
-              <div className="grid grid-cols-1 gap-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:grid-cols-2">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700">
-                    Känslighet för likadana nummer (Dubbletträkning)
-                  </label>
-                  <p className="mb-1.5 text-[11px] text-slate-500">
-                    Hur länge kameran lämnar låda 1 innan låda 2 räknas som +1
-                  </p>
-                  <select
-                    value={sensitivity}
-                    onChange={(e) =>
-                      setSensitivity(e.target.value as SensitivityMode)
-                    }
-                    className="w-full rounded-lg border border-slate-300 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-800 focus:border-slate-500 focus:outline-none"
-                  >
-                    <option value="fast">
-                      Snabb (0.7s kameraförflyttning)
-                    </option>
-                    <option value="standard">
-                      Standard – Rekommenderad (1.1s + scenbyte)
-                    </option>
-                    <option value="strict">
-                      Extra säker mot skakning (1.8s + stort scenbyte)
-                    </option>
-                  </select>
+              {/* Quick Customer Chips + Sensitivity Settings */}
+              <div className="rounded-2xl border border-slate-200 bg-white p-3.5 shadow-sm sm:p-4">
+                <div className="mb-3">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-semibold text-slate-700">
+                      Snabbval av kund (om etiketten bara har t.ex.{" "}
+                      <span className="font-mono">del0615244</span> utan kundnamn)
+                    </label>
+                    {defaultCustomer && (
+                      <button
+                        type="button"
+                        onClick={() => setDefaultCustomer("")}
+                        className="text-[11px] font-semibold text-emerald-700 hover:underline"
+                      >
+                        Återställ till Auto
+                      </button>
+                    )}
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setDefaultCustomer("")}
+                      className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition ${
+                        defaultCustomer === ""
+                          ? "bg-slate-900 text-white"
+                          : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                      }`}
+                    >
+                      Auto (läs från etikett)
+                    </button>
+                    {knownCustomers.slice(0, 6).map((cust) => (
+                      <button
+                        key={cust}
+                        type="button"
+                        onClick={() => setDefaultCustomer(cust)}
+                        className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition ${
+                          defaultCustomer === cust
+                            ? "bg-emerald-600 text-white"
+                            : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                        }`}
+                      >
+                        {cust}
+                      </button>
+                    ))}
+                  </div>
                 </div>
 
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700">
-                    Förvald kund (valfritt reservval)
-                  </label>
-                  <p className="mb-1.5 text-[11px] text-slate-500">
-                    Används endast om en etikett helt saknar utskrivet kundnamn
-                  </p>
-                  <input
-                    type="text"
-                    list="known-customers-scan"
-                    value={defaultCustomer}
-                    onChange={(e) => setDefaultCustomer(e.target.value)}
-                    placeholder="Automatisk avläsning från etikett..."
-                    className="w-full rounded-lg border border-slate-300 bg-slate-50 px-3 py-1.5 text-xs text-slate-800 placeholder:text-slate-400 focus:border-slate-500 focus:bg-white focus:outline-none"
-                  />
-                  <datalist id="known-customers-scan">
-                    {knownCustomers.map((c) => (
-                      <option key={c} value={c} />
-                    ))}
-                  </datalist>
+                <div className="grid grid-cols-1 gap-3 border-t border-slate-100 pt-3 sm:grid-cols-2">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700">
+                      Dubbletträkning (likadana nummer)
+                    </label>
+                    <select
+                      value={sensitivity}
+                      onChange={(e) =>
+                        setSensitivity(e.target.value as SensitivityMode)
+                      }
+                      className="mt-1 w-full rounded-lg border border-slate-300 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-800 focus:border-slate-500 focus:outline-none"
+                    >
+                      <option value="fast">
+                        Snabb (snabb kameraförflyttning)
+                      </option>
+                      <option value="standard">
+                        Standard – Rekommenderad
+                      </option>
+                      <option value="strict">
+                        Extra strikt (2 bildrutor + stort scenbyte)
+                      </option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700">
+                      Eget kundnamn (valfritt)
+                    </label>
+                    <input
+                      type="text"
+                      list="known-customers-scan"
+                      value={defaultCustomer}
+                      onChange={(e) => setDefaultCustomer(e.target.value)}
+                      placeholder="Auto eller skriv kundnamn..."
+                      className="mt-1 w-full rounded-lg border border-slate-300 bg-slate-50 px-3 py-1.5 text-xs text-slate-800 placeholder:text-slate-400 focus:border-slate-500 focus:bg-white focus:outline-none"
+                    />
+                    <datalist id="known-customers-scan">
+                      {knownCustomers.map((c) => (
+                        <option key={c} value={c} />
+                      ))}
+                    </datalist>
+                  </div>
                 </div>
               </div>
             </div>
 
-            {/* RIGHT COLUMN: Live Categorized Feed & Instant Summary (5 cols) */}
+            {/* RIGHT COLUMN: Live Categorized Feed & Instant Excel Save (5 cols) */}
             <div className="flex flex-col rounded-2xl border border-slate-200 bg-white shadow-sm lg:col-span-5">
               <div className="border-b border-slate-200 p-4">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-2">
                   <div>
                     <h2 className="text-sm font-bold text-slate-900">
-                      Filmade &amp; kategoriserade paket
+                      Registrerade etiketter ({liveStats.total} st)
                     </h2>
                     <p className="text-xs text-slate-500">
-                      Uppdateras i realtid medan du filmar
+                      Sparas automatiskt till Excel när du stoppar
                     </p>
                   </div>
                   {rows.length > 0 && (
@@ -1395,10 +1779,10 @@ export const App: React.FC = () => {
                           downloadExcelForRows(rows);
                         }
                       }}
-                      className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700"
+                      className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 px-3.5 py-2 text-xs font-bold text-white shadow-sm hover:bg-emerald-700"
                     >
                       <Download className="h-3.5 w-3.5" />
-                      {isFilming ? "Färdigställ Excel" : "Spara Excel"}
+                      Spara Excel (.xlsx)
                     </button>
                   )}
                 </div>
@@ -1435,32 +1819,29 @@ export const App: React.FC = () => {
               {/* Live Scanned Rows List */}
               <div className="max-h-[460px] flex-1 divide-y divide-slate-100 overflow-y-auto">
                 {rows.length === 0 ? (
-                  <div className="px-6 py-12 text-center">
+                  <div className="px-6 py-10 text-center">
                     <div className="mx-auto flex h-11 w-11 items-center justify-center rounded-xl bg-slate-100 text-slate-400">
                       <FileSpreadsheet className="h-5 w-5" />
                     </div>
                     <p className="mt-3 text-xs font-semibold text-slate-700">
-                      Listan är tom
+                      Inga etiketter skannade ännu
                     </p>
                     <p className="mx-auto mt-1 max-w-xs text-xs leading-relaxed text-slate-500">
-                      Exempel: Står det{" "}
-                      <span className="font-semibold text-slate-700">
-                        Microsoft
+                      Rikta mobilkameran mot etiketter som innehåller t.ex.{" "}
+                      <span className="font-mono font-semibold text-slate-800">
+                        del0615244
                       </span>{" "}
-                      och{" "}
-                      <span className="font-mono font-semibold text-slate-700">
-                        Del001234567
-                      </span>{" "}
-                      på två paket visas{" "}
-                      <span className="font-semibold text-emerald-700">
-                        Kund Microsoft • Delivery • Del001234567 • Antal: 2
+                      eller{" "}
+                      <span className="font-mono font-semibold text-slate-800">
+                        rem...
                       </span>
-                      .
+                      . Varje avläst etikett piper till och dyker upp här!
                     </p>
                   </div>
                 ) : (
                   rows.map((row) => {
-                    const isCurrentlyLocked = activeLockedId === row.id && isFilming;
+                    const isCurrentlyLocked =
+                      activeLockedId === row.id && isFilming;
                     const lastThumb =
                       row.snapshots.length > 0
                         ? row.snapshots[row.snapshots.length - 1].thumbnail
@@ -1507,8 +1888,7 @@ export const App: React.FC = () => {
                                 : row.numberTitle}
                             </div>
                             <div className="text-[11px] text-slate-400">
-                              Kund {row.customer} {row.category} •{" "}
-                              {row.verifiedBy}
+                              {row.verifiedBy} • {row.firstSeen}
                             </div>
                           </div>
                         </div>
@@ -1549,7 +1929,7 @@ export const App: React.FC = () => {
                     className="flex w-full items-center justify-center gap-2 rounded-xl bg-slate-900 px-4 py-2.5 text-xs font-semibold text-white hover:bg-slate-800"
                   >
                     <FileSpreadsheet className="h-4 w-4 text-emerald-400" />
-                    Granska alla detaljer &amp; ladda ner Excel (.xlsx)
+                    Granska lista &amp; dela/spara Excel (.xlsx)
                   </button>
                 </div>
               )}

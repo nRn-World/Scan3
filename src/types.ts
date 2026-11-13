@@ -26,6 +26,8 @@ export interface AnalyzeFrameResponse {
   scene_signature: number[];
   detections: FrameDetection[];
   ocr_regions: OcrOverlayRegion[];
+  raw_text_preview?: string;
+  engine_label?: string;
 }
 
 export interface ScanSnapshot {

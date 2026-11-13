@@ -161,12 +161,12 @@ REMOVAL_FULL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Prefix + digits (handles OCR reading 'Del' as 'DeI' or 'De1' before 00.../long digits)
+# Prefix + digits (handles OCR reading 'Del' as 'DeI', 'de1', 'clel', or border-glued '1del0615244')
 DELIVERY_PREFIX_RE = re.compile(
-    r"(?<![A-Za-z0-9])([Dd][Ee3][LlIi|]|[Dd][Ee]1(?=[0Oo]{2}|\d{5,})|[Dd][Ll][Vv])[\s\-_:#.]*([0-9OoQqIiLl|ZzSsGB]{4,16})(?![A-Za-z0-9])"
+    r"([Dd][Ee3][LlIi1|!]|[Cc][Ll][Ee][LlIi1|!]|[Dd][Ll][Vv])[\s\-_:#.]*([0-9OoQqDdIiLl|!ZzSsGbB]{4,16})(?![A-Za-z0-9])"
 )
 REMOVAL_PREFIX_RE = re.compile(
-    r"(?<![A-Za-z0-9])([Rr][Ee3][Mm]|[Rr][Mm][Vv]|[Rr][Ee][Tt])[\s\-_:#.]*([0-9OoQqIiLl|ZzSsGB]{4,16})(?![A-Za-z0-9])"
+    r"([Rr][Ee3][Mm]|[Rr][Mm][Vv]|[Rr][Ee][Tt])[\s\-_:#.]*([0-9OoQqDdIiLl|!ZzSsGbB]{4,16})(?![A-Za-z0-9])"
 )
 
 PURE_DIGITS_RE = re.compile(r"^\d{6,16}$")
@@ -195,9 +195,11 @@ class ParsedCode:
     digits: str            # "001234567"
 
 
-def _clean_numeric_tail(raw_tail: str, min_digit_ratio: float = 0.75) -> Optional[str]:
-    compact = re.sub(r"[\s\-_]", "", raw_tail)
-    if len(compact) < 4 or len(compact) > 16:
+def _clean_numeric_tail(
+    raw_tail: str, min_len: int = 4, min_digit_ratio: float = 0.70
+) -> Optional[str]:
+    compact = re.sub(r"[\s\-_.:#]", "", raw_tail)
+    if len(compact) < min_len or len(compact) > 16:
         return None
     real_digits = sum(1 for ch in compact if ch.isdigit())
     if real_digits / len(compact) < min_digit_ratio:
@@ -245,9 +247,16 @@ def parse_tracking_tokens(text: str) -> List[ParsedCode]:
 
     # 2. Prefix DEL / DLV / REM / RMV / RET + digits
     for m in DELIVERY_PREFIX_RE.finditer(cleaned):
+        start_idx = m.start()
+        if start_idx >= 2 and cleaned[start_idx - 2 : start_idx].lower() == "mo":
+            continue
+        prev_ch = cleaned[start_idx - 1] if start_idx > 0 else ""
+        min_len = 6 if (prev_ch.isalpha() and prev_ch not in "Ili") else 4
         raw_pref, raw_tail = m.group(1), m.group(2)
-        digits = _clean_numeric_tail(raw_tail)
+        digits = _clean_numeric_tail(raw_tail, min_len=min_len)
         if not digits:
+            continue
+        if raw_pref.endswith("1") and len(digits) < 5:
             continue
         pref_up = "DLV" if raw_pref.upper().startswith("DL") else "DEL"
         pref_title = pref_up.capitalize()

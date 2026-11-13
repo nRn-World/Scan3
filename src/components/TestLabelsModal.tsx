@@ -9,17 +9,17 @@ interface TestLabelsModalProps {
 
 const SAMPLE_LABELS = [
   {
-    boxTag: "Låda #1 (Exempel från din beskrivning)",
+    boxTag: "Låda #1 (7-siffrigt del-nummer med små bokstäver)",
     customer: "Microsoft",
-    number: "Del001234567",
-    barcode: "DEL001234567",
+    number: "del0615244",
+    barcode: "del0615244",
     type: "Delivery",
   },
   {
-    boxTag: "Låda #2 (Likadant nummer → ger Antal: 2)",
+    boxTag: "Låda #2 (Endast text 'del0615244' utan streckkod → ger Antal: 2)",
     customer: "Microsoft",
-    number: "Del001234567",
-    barcode: "DEL001234567",
+    number: "del0615244",
+    barcode: null,
     type: "Delivery",
   },
   {
@@ -32,7 +32,7 @@ const SAMPLE_LABELS = [
   {
     boxTag: "Låda #4 (Endast utskriven text utan streckkod)",
     customer: "Google",
-    number: "Del009876543",
+    number: "del0619821",
     barcode: null,
     type: "Delivery",
   },
