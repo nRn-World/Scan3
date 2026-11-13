@@ -1,16 +1,14 @@
 import Tesseract from "tesseract.js";
 import {
-  BarcodeFormat,
-  BinaryBitmap,
-  DecodeHintType,
-  HybridBinarizer,
-  MultiFormatReader,
-  RGBLuminanceSource,
-} from "@zxing/library";
+  prepareZXingModule,
+  readBarcodesFromImageData,
+  ReaderOptions,
+} from "zxing-wasm/reader";
 import {
   AnalyzeFrameResponse,
   FrameDetection,
   OcrOverlayRegion,
+  PackageCategory,
 } from "../types";
 import { decodeCode128FromImageData } from "./code128Codec";
 import {
@@ -18,7 +16,8 @@ import {
   extractCustomerFromOcrLines,
   matchKnownCustomerClient,
   OcrLineItem,
-  ParsedTrackingCode,
+  parseBarcodePayloadClient,
+  ParsedBarcodeCandidate,
   parseTrackingTokensClient,
 } from "./labelParser";
 
@@ -38,45 +37,58 @@ declare global {
   }
 }
 
+export interface LocalScanOptions {
+  acceptAllBarcodes?: boolean;
+  defaultCategory?: PackageCategory;
+}
+
 export type LocalEngineStatus = "idle" | "loading" | "ready" | "error";
 
 let ocrWorkerPromise: Promise<Tesseract.Worker | null> | null = null;
-let ocrStatus: LocalEngineStatus = "idle";
+let zxingReadyPromise: Promise<boolean> | null = null;
+let engineStatus: LocalEngineStatus = "idle";
 const statusListeners = new Set<(st: LocalEngineStatus) => void>();
 
+// Shared recent OCR memory so fast 15fps barcode hits can pick up customer names & DEL/REM prefixes read 200ms ago!
+let recentOcrLinesCache: { tsMs: number; lines: OcrLineItem[] } = {
+  tsMs: 0,
+  lines: [],
+};
+
 function notifyStatus(st: LocalEngineStatus) {
-  ocrStatus = st;
+  engineStatus = st;
   for (const fn of statusListeners) {
     try {
       fn(st);
     } catch {
-      // ignore listener error
+      // ignore
     }
   }
-}
-
-export function getLocalOcrStatus(): LocalEngineStatus {
-  return ocrStatus;
 }
 
 export function subscribeLocalOcrStatus(
   fn: (st: LocalEngineStatus) => void
 ): () => void {
   statusListeners.add(fn);
-  fn(ocrStatus);
+  fn(engineStatus);
   return () => {
     statusListeners.delete(fn);
   };
 }
 
-let cachedDetector: InstanceType<NonNullable<typeof window.BarcodeDetector>> | null =
-  null;
+let cachedDetector: InstanceType<
+  NonNullable<typeof window.BarcodeDetector>
+> | null = null;
 let detectorChecked = false;
 
 function getNativeBarcodeDetector() {
   if (detectorChecked) return cachedDetector;
   detectorChecked = true;
-  if (typeof window !== "undefined" && "BarcodeDetector" in window && window.BarcodeDetector) {
+  if (
+    typeof window !== "undefined" &&
+    "BarcodeDetector" in window &&
+    window.BarcodeDetector
+  ) {
     try {
       cachedDetector = new window.BarcodeDetector({
         formats: [
@@ -87,6 +99,11 @@ function getNativeBarcodeDetector() {
           "data_matrix",
           "itf",
           "ean_13",
+          "ean_8",
+          "upc_a",
+          "pdf417",
+          "aztec",
+          "codabar",
         ],
       });
     } catch {
@@ -96,40 +113,73 @@ function getNativeBarcodeDetector() {
   return cachedDetector;
 }
 
-let zxingReader: MultiFormatReader | null = null;
-function getZxingReader(): MultiFormatReader {
-  if (!zxingReader) {
-    const hints = new Map();
-    hints.set(DecodeHintType.POSSIBLE_FORMATS, [
-      BarcodeFormat.CODE_128,
-      BarcodeFormat.CODE_39,
-      BarcodeFormat.CODE_93,
-      BarcodeFormat.ITF,
-      BarcodeFormat.EAN_13,
-      BarcodeFormat.QR_CODE,
-      BarcodeFormat.DATA_MATRIX,
-      BarcodeFormat.PDF_417,
-    ]);
-    hints.set(DecodeHintType.TRY_HARDER, true);
-    zxingReader = new MultiFormatReader();
-    zxingReader.setHints(hints);
-  }
-  return zxingReader;
+function warmupZxingWasm(): Promise<boolean> {
+  if (zxingReadyPromise) return zxingReadyPromise;
+  zxingReadyPromise = (async () => {
+    if (
+      typeof window !== "undefined" &&
+      (window.location.protocol === "http:" ||
+        window.location.protocol === "https:") &&
+      window.location.origin !== "null"
+    ) {
+      try {
+        const ocrDir = new URL("./ocr", window.location.href).href.replace(
+          /\/$/,
+          ""
+        );
+        await prepareZXingModule({
+          overrides: {
+            locateFile: (path: string, prefix: string) => {
+              if (path.endsWith(".wasm")) {
+                return `${ocrDir}/zxing_reader.wasm`;
+              }
+              return prefix + path;
+            },
+          },
+          fireImmediately: true,
+        });
+        return true;
+      } catch (err) {
+        console.warn("Local zxing_reader.wasm fallback to CDN:", err);
+      }
+    }
+
+    try {
+      await prepareZXingModule({ fireImmediately: true });
+      return true;
+    } catch (err) {
+      console.error("Failed to initialize zxing-wasm:", err);
+      zxingReadyPromise = null;
+      return false;
+    }
+  })();
+  return zxingReadyPromise;
 }
 
 export function warmupLocalScanner(): Promise<Tesseract.Worker | null> {
+  // Start C++ ZXing WASM immediately in parallel!
+  warmupZxingWasm().then((ok) => {
+    if (ok && engineStatus === "loading") {
+      // Barcode engine is already ready within ~80ms even while OCR finishes loading
+      notifyStatus("ready");
+    }
+  });
+
   if (ocrWorkerPromise) return ocrWorkerPromise;
   notifyStatus("loading");
 
   ocrWorkerPromise = (async () => {
-    // 1. Prefer same-origin ./ocr/* assets (fast, offline-capable, works on GitHub Pages /Scan3/)
     if (
       typeof window !== "undefined" &&
-      (window.location.protocol === "http:" || window.location.protocol === "https:") &&
+      (window.location.protocol === "http:" ||
+        window.location.protocol === "https:") &&
       window.location.origin !== "null"
     ) {
       try {
-        const ocrDir = new URL("./ocr", window.location.href).href.replace(/\/$/, "");
+        const ocrDir = new URL("./ocr", window.location.href).href.replace(
+          /\/$/,
+          ""
+        );
         const worker = await Tesseract.createWorker("eng", 1, {
           workerPath: `${ocrDir}/worker.min.js`,
           corePath: ocrDir,
@@ -147,7 +197,6 @@ export function warmupLocalScanner(): Promise<Tesseract.Worker | null> {
       }
     }
 
-    // 2. Fallback to default Tesseract CDN (e.g. standalone HTML file://)
     try {
       const worker = await Tesseract.createWorker("eng", 1);
       await worker.setParameters({
@@ -158,7 +207,6 @@ export function warmupLocalScanner(): Promise<Tesseract.Worker | null> {
       return worker;
     } catch (err) {
       console.error("Failed to initialize Tesseract worker:", err);
-      notifyStatus("error");
       ocrWorkerPromise = null;
       return null;
     }
@@ -245,6 +293,368 @@ function cropThumbnail(
   return out.toDataURL("image/jpeg", 0.76);
 }
 
+interface RawBarcodeHit {
+  rawValue: string;
+  format: string;
+  bbox: [number, number, number, number];
+}
+
+const ZXING_READER_OPTIONS: ReaderOptions = {
+  tryHarder: true,
+  tryRotate: true,
+  tryInvert: true,
+  tryDownscale: true,
+  binarizer: "LocalAverage",
+  maxNumberOfSymbols: 12,
+};
+
+async function detectAllBarcodesOnCanvas(
+  canvas: HTMLCanvasElement
+): Promise<RawBarcodeHit[]> {
+  const w = Math.max(1, canvas.width);
+  const h = Math.max(1, canvas.height);
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx || w < 16 || h < 16) return [];
+
+  const hitMap = new Map<string, RawBarcodeHit>();
+
+  // 1. Industrial C++ ZXing-WASM (Code128, Code39, Code93, ITF, EAN, QR, DataMatrix, PDF417, Aztec — any angle!)
+  const zxingReady = await warmupZxingWasm();
+  if (zxingReady) {
+    try {
+      const imgData = ctx.getImageData(0, 0, w, h);
+      const results = await readBarcodesFromImageData(
+        imgData,
+        ZXING_READER_OPTIONS
+      );
+      for (const r of results) {
+        const val = (r.text || "").trim();
+        if (!val) continue;
+        const pts = [
+          r.position.topLeft,
+          r.position.topRight,
+          r.position.bottomRight,
+          r.position.bottomLeft,
+        ];
+        const xs = pts.map((p) => p.x / w);
+        const ys = pts.map((p) => p.y / h);
+        const x1 = Math.max(0, Math.min(1, Math.min(...xs) - 0.015));
+        const y1 = Math.max(0, Math.min(1, Math.min(...ys) - 0.02));
+        const x2 = Math.max(0, Math.min(1, Math.max(...xs) + 0.015));
+        const y2 = Math.max(0, Math.min(1, Math.max(...ys) + 0.02));
+        hitMap.set(val, {
+          rawValue: val,
+          format: r.format || "Barcode",
+          bbox: [x1, y1, x2, y2],
+        });
+      }
+    } catch {
+      // ignore transient decode error
+    }
+  }
+
+  // 2. Native OS BarcodeDetector (Hardware accelerator on Android Chrome / macOS)
+  const detector = getNativeBarcodeDetector();
+  if (detector) {
+    try {
+      const hits = await detector.detect(canvas);
+      for (const hit of hits) {
+        const val = (hit.rawValue || "").trim();
+        if (!val || hitMap.has(val)) continue;
+        const bb = hit.boundingBox;
+        hitMap.set(val, {
+          rawValue: val,
+          format: hit.format || "Barcode",
+          bbox: [
+            Math.max(0, bb.x / w),
+            Math.max(0, bb.y / h),
+            Math.min(1, (bb.x + bb.width) / w),
+            Math.min(1, (bb.y + bb.height) / h),
+          ],
+        });
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  // 3. Pure TS Code128 scanline backup
+  if (hitMap.size === 0) {
+    try {
+      const imgData = ctx.getImageData(0, 0, w, h);
+      for (const sh of decodeCode128FromImageData(imgData)) {
+        if (!hitMap.has(sh.text)) {
+          hitMap.set(sh.text, {
+            rawValue: sh.text,
+            format: "Code128",
+            bbox: sh.bbox,
+          });
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return Array.from(hitMap.values());
+}
+
+function buildDetectionsFromBarcodesAndOcr(
+  canvas: HTMLCanvasElement,
+  barcodeHits: RawBarcodeHit[],
+  ocrLines: OcrLineItem[],
+  knownCustomers: string[],
+  options: LocalScanOptions
+): FrameDetection[] {
+  const acceptAllBarcodes = options.acceptAllBarcodes ?? true;
+  const defaultCategory = options.defaultCategory ?? "Delivery";
+
+  // Stitch split OCR words on same line ("del" + "0615244")
+  const stitchedLines: OcrLineItem[] = [...ocrLines];
+  for (let i = 0; i < ocrLines.length; i++) {
+    const a = ocrLines[i];
+    if (
+      !/^(?:DEL|DLV|REM|RMV|RET|DELIVERY|REMOVAL)[:\-#]?$/i.test(a.text.trim())
+    ) {
+      continue;
+    }
+    const ay = (a.bbox[1] + a.bbox[3]) / 2;
+    const ah = Math.max(0.02, a.bbox[3] - a.bbox[1]);
+    for (let j = 0; j < ocrLines.length; j++) {
+      if (i === j) continue;
+      const b = ocrLines[j];
+      const by = (b.bbox[1] + b.bbox[3]) / 2;
+      if (
+        Math.abs(ay - by) < ah * 0.9 &&
+        b.bbox[0] >= a.bbox[0] - 0.02 &&
+        b.bbox[0] - a.bbox[2] < 0.16
+      ) {
+        stitchedLines.push({
+          text: `${a.text} ${b.text}`,
+          confidence: Math.min(a.confidence, b.confidence),
+          bbox: [
+            Math.min(a.bbox[0], b.bbox[0]),
+            Math.min(a.bbox[1], b.bbox[1]),
+            Math.max(a.bbox[2], b.bbox[2]),
+            Math.max(a.bbox[3], b.bbox[3]),
+          ],
+        });
+      }
+    }
+  }
+
+  // Parse all OCR DEL/REM codes first so we know if an explicit DEL/REM is on this sticker
+  const ocrParsedCodes = new Map<
+    string,
+    {
+      parsed: ParsedBarcodeCandidate;
+      line: OcrLineItem;
+      edgeClipped: boolean;
+    }
+  >();
+
+  for (const line of stitchedLines) {
+    if (line.confidence < 0.34) continue;
+    for (const pc of parseTrackingTokensClient(line.text)) {
+      const edgeClipped = line.bbox[0] <= 0.012 || line.bbox[2] >= 0.988;
+      const prev = ocrParsedCodes.get(pc.canonicalId);
+      if (!prev || line.confidence > prev.line.confidence) {
+        ocrParsedCodes.set(pc.canonicalId, {
+          parsed: { ...pc, isExplicitPrefix: true },
+          line,
+          edgeClipped,
+        });
+      }
+    }
+  }
+
+  // Parse all Barcode hits
+  interface BarcodeCandidateEntry {
+    parsed: ParsedBarcodeCandidate;
+    hit: RawBarcodeHit;
+    embeddedCust: string;
+  }
+  const barcodeCandidates: BarcodeCandidateEntry[] = [];
+
+  for (const hit of barcodeHits) {
+    let embeddedCust = "";
+    for (const part of hit.rawValue.split(/[|;,\n\t/]+/)) {
+      const m = matchKnownCustomerClient(part, knownCustomers);
+      if (m) {
+        embeddedCust = m;
+        break;
+      }
+    }
+
+    const parsedList = parseBarcodePayloadClient(
+      hit.rawValue,
+      acceptAllBarcodes,
+      defaultCategory
+    );
+
+    for (const p of parsedList) {
+      // Check if pure-digit barcode (e.g. "0615244") matches an OCR DEL/REM code (e.g. "DEL0615244")!
+      if (!p.isExplicitPrefix && p.digits.length >= 4) {
+        let upgradedToOcr = false;
+        for (const ocrEntry of ocrParsedCodes.values()) {
+          if (ocrEntry.parsed.digits === p.digits) {
+            barcodeCandidates.push({
+              parsed: ocrEntry.parsed,
+              hit,
+              embeddedCust,
+            });
+            upgradedToOcr = true;
+            break;
+          }
+        }
+        if (upgradedToOcr) continue;
+      }
+      barcodeCandidates.push({ parsed: p, hit, embeddedCust });
+    }
+  }
+
+  // If ANY barcode or OCR on this frame has an explicit DEL/REM prefix, prioritize explicit DEL/REM codes
+  // so carrier barcodes (e.g. JJD0099...) on the same label don't create extra noise rows!
+  const hasAnyExplicitDelRem =
+    ocrParsedCodes.size > 0 ||
+    barcodeCandidates.some((b) => b.parsed.isExplicitPrefix);
+
+  const filteredBarcodeCandidates = hasAnyExplicitDelRem
+    ? barcodeCandidates.filter((b) => b.parsed.isExplicitPrefix)
+    : barcodeCandidates;
+
+  const merged = new Map<
+    string,
+    {
+      parsed: ParsedBarcodeCandidate;
+      confidence: number;
+      source: string;
+      bbox: [number, number, number, number];
+      edgeClipped: boolean;
+      customerHint: string;
+    }
+  >();
+
+  for (const bc of filteredBarcodeCandidates) {
+    merged.set(bc.parsed.canonicalId, {
+      parsed: bc.parsed,
+      confidence: 0.99,
+      source: `barcode:${bc.hit.format}`,
+      bbox: bc.hit.bbox,
+      edgeClipped: false,
+      customerHint: bc.embeddedCust,
+    });
+  }
+
+  for (const [cid, ocrItem] of ocrParsedCodes.entries()) {
+    const existing = merged.get(cid);
+    if (existing) {
+      existing.source = "barcode+ocr";
+      existing.confidence = 0.995;
+      existing.bbox = [
+        Math.min(existing.bbox[0], ocrItem.line.bbox[0]),
+        Math.min(existing.bbox[1], ocrItem.line.bbox[1]),
+        Math.max(existing.bbox[2], ocrItem.line.bbox[2]),
+        Math.max(existing.bbox[3], ocrItem.line.bbox[3]),
+      ];
+    } else {
+      const boostedConf = Math.min(
+        0.98,
+        Math.max(
+          ocrItem.line.confidence,
+          ocrItem.parsed.digits.length >= 6 ? 0.82 : ocrItem.line.confidence
+        )
+      );
+      merged.set(cid, {
+        parsed: ocrItem.parsed,
+        confidence: boostedConf,
+        source: "ocr",
+        bbox: ocrItem.line.bbox,
+        edgeClipped: ocrItem.edgeClipped,
+        customerHint: "",
+      });
+    }
+  }
+
+  const detections: FrameDetection[] = [];
+  for (const item of merged.values()) {
+    const custInfo = item.customerHint
+      ? {
+          customer: item.customerHint,
+          confidence: 0.98,
+          source: "barcode_payload",
+        }
+      : extractCustomerFromOcrLines(
+          item.bbox,
+          ocrLines,
+          knownCustomers,
+          item.parsed.canonicalId
+        );
+
+    detections.push({
+      canonical_id: item.parsed.canonicalId,
+      display_title: item.parsed.displayTitle,
+      display_upper: item.parsed.displayUpper,
+      category: item.parsed.category,
+      customer: custInfo.customer,
+      customer_confidence: Math.round(custInfo.confidence * 1000) / 1000,
+      customer_source: custInfo.source,
+      confidence: Math.round(item.confidence * 1000) / 1000,
+      source: item.source,
+      edge_clipped: item.edgeClipped,
+      bbox: item.bbox,
+      thumbnail: cropThumbnail(canvas, item.bbox),
+    });
+  }
+
+  detections.sort((a, b) => b.confidence - a.confidence);
+  return detections;
+}
+
+/**
+ * FAST 15 FPS BARCODE SCANNER (~18ms per frame on full-HD camera frames!)
+ * Runs independently without waiting for Tesseract OCR so barcodes lock immediately!
+ */
+export async function scanBarcodesFastLocally(
+  canvas: HTMLCanvasElement,
+  customCustomers: string[] = [],
+  options: LocalScanOptions = {}
+): Promise<AnalyzeFrameResponse> {
+  const { signature, sharpness } = computeSceneSignatureAndSharpness(canvas);
+  const knownCustomers = Array.from(
+    new Set([...DEFAULT_CUSTOMERS_LIST, ...customCustomers.filter(Boolean)])
+  );
+
+  const barcodeHits = await detectAllBarcodesOnCanvas(canvas);
+  const nowMs = performance.now();
+  const freshOcrLines =
+    nowMs - recentOcrLinesCache.tsMs < 1500 ? recentOcrLinesCache.lines : [];
+
+  const detections =
+    barcodeHits.length > 0
+      ? buildDetectionsFromBarcodesAndOcr(
+          canvas,
+          barcodeHits,
+          freshOcrLines,
+          knownCustomers,
+          options
+        )
+      : [];
+
+  const barcodePreview = barcodeHits
+    .map((h) => `[${h.format}] ${h.rawValue}`)
+    .join(" · ");
+
+  return {
+    sharpness,
+    scene_signature: signature,
+    detections,
+    ocr_regions: [],
+    raw_text_preview: barcodePreview,
+    engine_label: "ZXing-WASM Streckkod",
+  };
+}
+
 interface PreparedCrop {
   ocrCanvas: HTMLCanvasElement;
   borderPx: number;
@@ -255,11 +665,6 @@ interface PreparedCrop {
   scale: number;
 }
 
-/**
- * Extracts a crisp region of interest, upscales small mobile crops, applies
- * 3%-96% histogram contrast stretching + mild unsharp mask + 14px white border
- * so Tesseract LSTM reads phone-filmed labels like `del0615244` cleanly.
- */
 function buildEnhancedOcrCrop(
   src: HTMLCanvasElement,
   normBox: [number, number, number, number]
@@ -268,15 +673,20 @@ function buildEnhancedOcrCrop(
   const sh = src.height;
   const cropX = Math.max(0, Math.floor(normBox[0] * sw));
   const cropY = Math.max(0, Math.floor(normBox[1] * sh));
-  const cropW = Math.max(48, Math.min(sw - cropX, Math.ceil((normBox[2] - normBox[0]) * sw)));
-  const cropH = Math.max(36, Math.min(sh - cropY, Math.ceil((normBox[3] - normBox[1]) * sh)));
+  const cropW = Math.max(
+    48,
+    Math.min(sw - cropX, Math.ceil((normBox[2] - normBox[0]) * sw))
+  );
+  const cropH = Math.max(
+    36,
+    Math.min(sh - cropY, Math.ceil((normBox[3] - normBox[1]) * sh))
+  );
 
-  // Target width around 760px for crisp character strokes without WASM lag
   let scale = 1.0;
   if (cropW < 520) {
     scale = Math.min(2.0, 680 / cropW);
-  } else if (cropW > 900) {
-    scale = 900 / cropW;
+  } else if (cropW > 920) {
+    scale = 920 / cropW;
   }
 
   const innerW = Math.max(48, Math.round(cropW * scale));
@@ -288,16 +698,33 @@ function buildEnhancedOcrCrop(
   out.height = innerH + borderPx * 2;
   const ctx = out.getContext("2d", { willReadFrequently: true });
   if (!ctx) {
-    return { ocrCanvas: src, borderPx: 0, cropX: 0, cropY: 0, cropW: sw, cropH: sh, scale: 1 };
+    return {
+      ocrCanvas: src,
+      borderPx: 0,
+      cropX: 0,
+      cropY: 0,
+      cropW: sw,
+      cropH: sh,
+      scale: 1,
+    };
   }
 
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, out.width, out.height);
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(src, cropX, cropY, cropW, cropH, borderPx, borderPx, innerW, innerH);
+  ctx.drawImage(
+    src,
+    cropX,
+    cropY,
+    cropW,
+    cropH,
+    borderPx,
+    borderPx,
+    innerW,
+    innerH
+  );
 
-  // Contrast stretch + grayscale normalization inside inner region
   const imgData = ctx.getImageData(borderPx, borderPx, innerW, innerH);
   const px = imgData.data;
   const n = innerW * innerH;
@@ -332,7 +759,6 @@ function buildEnhancedOcrCrop(
     stretched[i] = norm;
   }
 
-  // Mild 3x3 sharpening to crisp up phone motion / slightly soft autofocus
   for (let y = 0; y < innerH; y++) {
     for (let x = 0; x < innerW; x++) {
       const idx = y * innerW + x;
@@ -344,7 +770,10 @@ function buildEnhancedOcrCrop(
             stretched[idx - 1] +
             stretched[idx + 1]) *
           0.25;
-        val = Math.max(0, Math.min(255, Math.round(val + (val - blur) * 0.65)));
+        val = Math.max(
+          0,
+          Math.min(255, Math.round(val + (val - blur) * 0.65))
+        );
       }
       const p = idx * 4;
       px[p] = val;
@@ -358,54 +787,17 @@ function buildEnhancedOcrCrop(
   return { ocrCanvas: out, borderPx, cropX, cropY, cropW, cropH, scale };
 }
 
-function decodeZxingFromCanvas(
-  canvas: HTMLCanvasElement
-): Array<{ rawValue: string; bbox: [number, number, number, number] }> {
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  if (!ctx || canvas.width < 16 || canvas.height < 16) return [];
-
-  try {
-    const reader = getZxingReader();
-    const w = canvas.width;
-    const h = canvas.height;
-    const rgba = ctx.getImageData(0, 0, w, h).data;
-    const luminances = new Uint8ClampedArray(w * h);
-    for (let i = 0; i < w * h; i++) {
-      luminances[i] =
-        (rgba[i * 4] * 306 + rgba[i * 4 + 1] * 601 + rgba[i * 4 + 2] * 117) >> 10;
-    }
-    const source = new RGBLuminanceSource(luminances, w, h);
-    const bitmap = new BinaryBitmap(new HybridBinarizer(source));
-    const res = reader.decode(bitmap);
-    const txt = res?.getText()?.trim();
-    if (!txt) return [];
-
-    const pts = res.getResultPoints() || [];
-    let x1 = 0.15;
-    let y1 = 0.25;
-    let x2 = 0.85;
-    let y2 = 0.75;
-    if (pts.length >= 2) {
-      const xs = pts.map((p) => p.getX() / w);
-      const ys = pts.map((p) => p.getY() / h);
-      x1 = Math.max(0, Math.min(...xs) - 0.03);
-      x2 = Math.min(1, Math.max(...xs) + 0.03);
-      y1 = Math.max(0, Math.min(...ys) - 0.06);
-      y2 = Math.min(1, Math.max(...ys) + 0.06);
-    }
-    return [{ rawValue: txt, bbox: [x1, y1, x2, y2] }];
-  } catch {
-    // NotFoundException when frame has no barcode
-    return [];
-  }
-}
-
 let frameToggle = 0;
 
+/**
+ * FULL BARCODE + TESSERACT LSTM OCR PASS
+ * Used by background OCR loop during live filming AND for uploaded/demo videos.
+ */
 export async function analyzeFrameLocally(
   canvas: HTMLCanvasElement,
   customCustomers: string[] = [],
-  focusBox?: [number, number, number, number]
+  focusBox?: [number, number, number, number],
+  options: LocalScanOptions = {}
 ): Promise<AnalyzeFrameResponse> {
   const { signature, sharpness } = computeSceneSignatureAndSharpness(canvas);
   const w = Math.max(1, canvas.width);
@@ -415,95 +807,53 @@ export async function analyzeFrameLocally(
     new Set([...DEFAULT_CUSTOMERS_LIST, ...customCustomers.filter(Boolean)])
   );
 
-  const rawBarcodeHits = new Map<
-    string,
-    { bbox: [number, number, number, number]; source: string }
-  >();
-
-  // 1. Native BarcodeDetector (Android Chrome / Desktop Chrome / Edge)
-  const detector = getNativeBarcodeDetector();
-  if (detector) {
-    try {
-      const hits = await detector.detect(canvas);
-      for (const hit of hits) {
-        if (!hit.rawValue) continue;
-        const bb = hit.boundingBox;
-        rawBarcodeHits.set(hit.rawValue.trim(), {
-          bbox: [
-            Math.max(0, bb.x / w),
-            Math.max(0, bb.y / h),
-            Math.min(1, (bb.x + bb.width) / w),
-            Math.min(1, (bb.y + bb.height) / h),
-          ],
-          source: "barcode",
-        });
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  // 2. ZXing MultiFormatReader (Works on iOS Safari + Android + QR + Code128 + Code39)
-  for (const zhit of decodeZxingFromCanvas(canvas)) {
-    if (!rawBarcodeHits.has(zhit.rawValue)) {
-      rawBarcodeHits.set(zhit.rawValue, { bbox: zhit.bbox, source: "barcode" });
-    }
-  }
-
-  // 3. Fast Code128 scanline sweeps (extra sensitivity for synthetic/clean Code128)
-  if (rawBarcodeHits.size === 0) {
-    const ctx = canvas.getContext("2d", { willReadFrequently: true });
-    if (ctx) {
-      const imgData = ctx.getImageData(0, 0, w, h);
-      for (const sh of decodeCode128FromImageData(imgData)) {
-        if (!rawBarcodeHits.has(sh.text)) {
-          rawBarcodeHits.set(sh.text, { bbox: sh.bbox, source: "barcode" });
-        }
-      }
-    }
-  }
-
-  // 4. Tesseract.js LSTM OCR (essential for printed labels like `del0615244` + customer names!)
+  const barcodeHits = await detectAllBarcodesOnCanvas(canvas);
   const ocrLines: OcrLineItem[] = [];
   const rawPreviewTokens: string[] = [];
   const worker = await warmupLocalScanner();
 
   if (worker) {
     frameToggle = (frameToggle + 1) % 3;
-    // Choose focus crop first (especially sharp on mobile cameras); every 3rd frame also check full frame if needed
     const primaryNormBox: [number, number, number, number] =
       focusBox ||
-      (h > w * 1.15 ? [0.04, 0.18, 0.96, 0.82] : [0.02, 0.05, 0.98, 0.95]);
+      (h > w * 1.15 ? [0.04, 0.16, 0.96, 0.84] : [0.02, 0.05, 0.98, 0.95]);
 
     const runOcrPass = async (normBox: [number, number, number, number]) => {
       const prep = buildEnhancedOcrCrop(canvas, normBox);
-      // Also try ZXing on the contrast-enhanced crop if no barcode found yet!
-      if (rawBarcodeHits.size === 0) {
-        for (const zc of decodeZxingFromCanvas(prep.ocrCanvas)) {
+
+      // If raw frame didn't decode a low-contrast barcode, check the contrast-stretched crop too!
+      if (barcodeHits.length === 0) {
+        const cropBc = await detectAllBarcodesOnCanvas(prep.ocrCanvas);
+        for (const zc of cropBc) {
           const bx1 =
             (prep.cropX +
-              ((zc.bbox[0] * prep.ocrCanvas.width - prep.borderPx) / prep.scale)) /
+              (zc.bbox[0] * prep.ocrCanvas.width - prep.borderPx) /
+                prep.scale) /
             w;
           const by1 =
             (prep.cropY +
-              ((zc.bbox[1] * prep.ocrCanvas.height - prep.borderPx) / prep.scale)) /
+              (zc.bbox[1] * prep.ocrCanvas.height - prep.borderPx) /
+                prep.scale) /
             h;
           const bx2 =
             (prep.cropX +
-              ((zc.bbox[2] * prep.ocrCanvas.width - prep.borderPx) / prep.scale)) /
+              (zc.bbox[2] * prep.ocrCanvas.width - prep.borderPx) /
+                prep.scale) /
             w;
           const by2 =
             (prep.cropY +
-              ((zc.bbox[3] * prep.ocrCanvas.height - prep.borderPx) / prep.scale)) /
+              (zc.bbox[3] * prep.ocrCanvas.height - prep.borderPx) /
+                prep.scale) /
             h;
-          rawBarcodeHits.set(zc.rawValue, {
+          barcodeHits.push({
+            rawValue: zc.rawValue,
+            format: zc.format,
             bbox: [
               Math.max(0, Math.min(1, bx1)),
               Math.max(0, Math.min(1, by1)),
               Math.max(0, Math.min(1, bx2)),
               Math.max(0, Math.min(1, by2)),
             ],
-            source: "barcode",
           });
         }
       }
@@ -538,18 +888,23 @@ export async function analyzeFrameLocally(
           for (const line of para.lines || []) {
             const ltxt = (line.text || "").trim();
             if (!ltxt) continue;
-            const conf01 = Math.max(0, Math.min(1, (line.confidence ?? 70) / 100));
+            const conf01 = Math.max(
+              0,
+              Math.min(1, (line.confidence ?? 70) / 100)
+            );
             const mapped = mapBbox(line.bbox);
             passLines.push({ text: ltxt, confidence: conf01, bbox: mapped });
             if (conf01 >= 0.35 && ltxt.length >= 2) {
               rawPreviewTokens.push(ltxt);
             }
 
-            // Also inspect individual words in case noise surrounded `del0615244` on the same line
             for (const word of line.words || []) {
               const wtxt = (word.text || "").trim();
               if (wtxt && wtxt !== ltxt && wtxt.length >= 4) {
-                const wconf = Math.max(0, Math.min(1, (word.confidence ?? 68) / 100));
+                const wconf = Math.max(
+                  0,
+                  Math.min(1, (word.confidence ?? 68) / 100)
+                );
                 passLines.push({
                   text: wtxt,
                   confidence: wconf,
@@ -561,7 +916,6 @@ export async function analyzeFrameLocally(
         }
       }
 
-      // Fallback if blocks were empty but full text had lines
       if (passLines.length === 0 && ret.data.text) {
         for (const rawLine of ret.data.text.split(/\r?\n/)) {
           const t = rawLine.trim();
@@ -592,8 +946,12 @@ export async function analyzeFrameLocally(
         primaryNormBox[2] < 0.95 ||
         primaryNormBox[3] < 0.92;
 
-      // Every 3rd frame, if focus box had no tracking code, also sweep full frame (catches off-center labels & multi-box videos)
-      if (!foundInFirst && rawBarcodeHits.size === 0 && isCroppedBox && frameToggle === 0) {
+      if (
+        !foundInFirst &&
+        barcodeHits.length === 0 &&
+        isCroppedBox &&
+        frameToggle === 0
+      ) {
         const wideLines = await runOcrPass([0.01, 0.02, 0.99, 0.98]);
         ocrLines.push(...wideLines);
       }
@@ -602,145 +960,15 @@ export async function analyzeFrameLocally(
     }
   }
 
-  // Horizontal stitching for split words on the same line (e.g. "del" + "0615244")
-  const stitchedLines: OcrLineItem[] = [...ocrLines];
-  for (let i = 0; i < ocrLines.length; i++) {
-    const a = ocrLines[i];
-    if (!/^(?:DEL|DLV|REM|RMV|RET|DELIVERY|REMOVAL)[:\-#]?$/i.test(a.text.trim())) {
-      continue;
-    }
-    const ay = (a.bbox[1] + a.bbox[3]) / 2;
-    const ah = Math.max(0.02, a.bbox[3] - a.bbox[1]);
-    for (let j = 0; j < ocrLines.length; j++) {
-      if (i === j) continue;
-      const b = ocrLines[j];
-      const by = (b.bbox[1] + b.bbox[3]) / 2;
-      if (Math.abs(ay - by) < ah * 0.9 && b.bbox[0] >= a.bbox[0] - 0.02 && b.bbox[0] - a.bbox[2] < 0.16) {
-        stitchedLines.push({
-          text: `${a.text} ${b.text}`,
-          confidence: Math.min(a.confidence, b.confidence),
-          bbox: [
-            Math.min(a.bbox[0], b.bbox[0]),
-            Math.min(a.bbox[1], b.bbox[1]),
-            Math.max(a.bbox[2], b.bbox[2]),
-            Math.max(a.bbox[3], b.bbox[3]),
-          ],
-        });
-      }
-    }
-  }
+  recentOcrLinesCache = { tsMs: performance.now(), lines: ocrLines };
 
-  // 5. Merge Barcodes + OCR tracking codes into structured FrameDetection items
-  const candidates = new Map<
-    string,
-    {
-      parsed: ParsedTrackingCode;
-      confidence: number;
-      source: string;
-      bbox: [number, number, number, number];
-      edgeClipped: boolean;
-      customerHint: string;
-    }
-  >();
-
-  for (const [rawVal, meta] of rawBarcodeHits.entries()) {
-    const parsedCodes = parseTrackingTokensClient(rawVal);
-    // Also check if QR/Barcode contains customer + code e.g. "Microsoft|DEL0615244"
-    let embeddedCust = "";
-    for (const part of rawVal.split(/[|;,\n\t/]+/)) {
-      const m = matchKnownCustomerClient(part, knownCustomers);
-      if (m) {
-        embeddedCust = m;
-        break;
-      }
-    }
-
-    for (const pc of parsedCodes) {
-      candidates.set(pc.canonicalId, {
-        parsed: pc,
-        confidence: 0.99,
-        source: meta.source,
-        bbox: meta.bbox,
-        edgeClipped: false,
-        customerHint: embeddedCust,
-      });
-    }
-  }
-
-  for (const line of stitchedLines) {
-    if (line.confidence < 0.34) continue;
-    const parsedCodes = parseTrackingTokensClient(line.text);
-    if (parsedCodes.length === 0) continue;
-
-    const edgeClipped = line.bbox[0] <= 0.012 || line.bbox[2] >= 0.988;
-
-    for (const pc of parsedCodes) {
-      const existing = candidates.get(pc.canonicalId);
-      if (existing) {
-        if (existing.source === "barcode") {
-          existing.source = "barcode+ocr";
-          existing.confidence = 0.995;
-          existing.bbox = [
-            Math.min(existing.bbox[0], line.bbox[0]),
-            Math.min(existing.bbox[1], line.bbox[1]),
-            Math.max(existing.bbox[2], line.bbox[2]),
-            Math.max(existing.bbox[3], line.bbox[3]),
-          ];
-        } else if (line.confidence > existing.confidence) {
-          existing.confidence = line.confidence;
-          existing.bbox = line.bbox;
-          existing.edgeClipped = existing.edgeClipped && edgeClipped;
-        }
-      } else {
-        // Boost confidence slightly when clean 6-14 digit DEL/REM pattern matches in Tesseract
-        const boostedConf = Math.min(
-          0.98,
-          Math.max(line.confidence, pc.digits.length >= 6 ? 0.82 : line.confidence)
-        );
-        candidates.set(pc.canonicalId, {
-          parsed: pc,
-          confidence: boostedConf,
-          source: "ocr",
-          bbox: line.bbox,
-          edgeClipped,
-          customerHint: "",
-        });
-      }
-    }
-  }
-
-  const detections: FrameDetection[] = [];
-  for (const item of candidates.values()) {
-    const custInfo = item.customerHint
-      ? {
-          customer: item.customerHint,
-          confidence: 0.98,
-          source: "barcode_payload",
-        }
-      : extractCustomerFromOcrLines(
-          item.bbox,
-          ocrLines,
-          knownCustomers,
-          item.parsed.canonicalId
-        );
-
-    detections.push({
-      canonical_id: item.parsed.canonicalId,
-      display_title: item.parsed.displayTitle,
-      display_upper: item.parsed.displayUpper,
-      category: item.parsed.category,
-      customer: custInfo.customer,
-      customer_confidence: Math.round(custInfo.confidence * 1000) / 1000,
-      customer_source: custInfo.source,
-      confidence: Math.round(item.confidence * 1000) / 1000,
-      source: item.source,
-      edge_clipped: item.edgeClipped,
-      bbox: item.bbox,
-      thumbnail: cropThumbnail(canvas, item.bbox),
-    });
-  }
-
-  detections.sort((a, b) => b.confidence - a.confidence);
+  const detections = buildDetectionsFromBarcodesAndOcr(
+    canvas,
+    barcodeHits,
+    ocrLines,
+    knownCustomers,
+    options
+  );
 
   const ocrRegions: OcrOverlayRegion[] = ocrLines.slice(0, 18).map((l) => ({
     text: l.text,
@@ -754,8 +982,14 @@ export async function analyzeFrameLocally(
     .slice(0, 4)
     .join(" · ");
 
-  const barcodePreview = Array.from(rawBarcodeHits.keys()).slice(0, 2).join(" · ");
-  const raw_text_preview = [barcodePreview, uniquePreview].filter(Boolean).join(" | ");
+  const barcodePreview = barcodeHits
+    .slice(0, 3)
+    .map((h) => `[${h.format}] ${h.rawValue}`)
+    .join(" · ");
+
+  const raw_text_preview = [barcodePreview, uniquePreview]
+    .filter(Boolean)
+    .join(" | ");
 
   return {
     sharpness,
@@ -763,6 +997,6 @@ export async function analyzeFrameLocally(
     detections,
     ocr_regions: ocrRegions,
     raw_text_preview,
-    engine_label: worker ? "Mobil OCR + Streckkod" : "Streckkod",
+    engine_label: "ZXing-WASM + OCR",
   };
 }

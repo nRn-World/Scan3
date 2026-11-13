@@ -567,11 +567,11 @@ class LabelScannerEngine:
 
         # 1. Fast C++ 1D/2D Barcode detection on full-resolution grayscale
         barcode_hits: Dict[str, Dict] = {}
-        pure_digit_barcodes: List[Tuple[str, Tuple[float, float, float, float], str]] = []
+        general_barcodes: List[Tuple[str, Tuple[float, float, float, float], str]] = []
         try:
-            bcs = zxingcpp.read_barcodes(gray_full)
+            bcs = zxingcpp.read_barcodes(gray_full, try_rotate=True, try_downscale=True)
             for bc in bcs:
-                raw_val = (bc.text or "").strip()
+                raw_val = re.sub(r"[\x00-\x1f\x7f]+", " ", (bc.text or "")).strip()
                 if not raw_val:
                     continue
                 pos = bc.position
@@ -593,8 +593,8 @@ class LabelScannerEngine:
                             "format": fmt_name,
                             "raw": raw_val,
                         }
-                elif PURE_DIGITS_RE.match(raw_val):
-                    pure_digit_barcodes.append((raw_val, bbox_norm, fmt_name))
+                elif len(raw_val) >= 3:
+                    general_barcodes.append((raw_val, bbox_norm, fmt_name))
         except Exception:
             pass
 
@@ -667,29 +667,38 @@ class LabelScannerEngine:
             elif PURE_DIGITS_RE.match(up_txt) and reg.confidence >= 0.84:
                 pure_digit_ocr.append((up_txt, reg.bbox, reg.confidence))
 
-        # 4. Fallback: if label explicitly says 'Delivery' or 'Removal' + pure digits barcode/line
-        if not barcode_hits and not ocr_hits and (label_has_delivery_word ^ label_has_removal_word):
-            cat = "Delivery" if label_has_delivery_word else "Removal"
-            pref_up = "DEL" if cat == "Delivery" else "REM"
-            pref_title = "Del" if cat == "Delivery" else "Rem"
-            for digits, bbox_n, fmt_name in pure_digit_barcodes:
-                cid = f"{pref_up}{digits}"
+        # 4. Fuse pure-digit barcodes with OCR DEL/REM if matching, or accept standalone barcodes
+        for raw_bc, bbox_n, fmt_name in general_barcodes:
+            clean_digits = re.sub(r"\D+", "", raw_bc)
+            matched_ocr = False
+            if len(clean_digits) >= 4:
+                for cid, oinfo in ocr_hits.items():
+                    if oinfo["parsed"].digits == clean_digits:
+                        barcode_hits[cid] = {
+                            "parsed": oinfo["parsed"],
+                            "bbox": bbox_n,
+                            "format": fmt_name,
+                            "raw": raw_bc,
+                        }
+                        matched_ocr = True
+                        break
+            if not matched_ocr and not barcode_hits and not ocr_hits:
+                cat = "Removal" if (label_has_removal_word and not label_has_delivery_word) else "Delivery"
+                if label_has_delivery_word or label_has_removal_word:
+                    pref_up = "DEL" if cat == "Delivery" else "REM"
+                    pref_title = "Del" if cat == "Delivery" else "Rem"
+                    cid = f"{pref_up}{clean_digits or raw_bc.upper()}"
+                    disp = f"{pref_title}{clean_digits or raw_bc}"
+                else:
+                    cid = re.sub(r"[\s\-_]+", "", raw_bc).upper()
+                    disp = raw_bc
+                    pref_up = "BAR"
                 barcode_hits[cid] = {
-                    "parsed": ParsedCode(cid, f"{pref_title}{digits}", cid, cat, pref_up, digits),
+                    "parsed": ParsedCode(cid, disp, cid, cat, pref_up, clean_digits),
                     "bbox": bbox_n,
                     "format": fmt_name,
-                    "raw": digits,
+                    "raw": raw_bc,
                 }
-            if not barcode_hits:
-                for digits, bbox_n, conf in pure_digit_ocr:
-                    cid = f"{pref_up}{digits}"
-                    ocr_hits[cid] = {
-                        "parsed": ParsedCode(cid, f"{pref_title}{digits}", cid, cat, pref_up, digits),
-                        "bbox": bbox_n,
-                        "confidence": conf,
-                        "edge_clipped": bbox_n[0] <= 0.018 or bbox_n[2] >= 0.982,
-                        "raw": digits,
-                    }
 
         # 5. Merge Barcode + OCR detections per unique canonical code in this frame
         #    (Prevents double-counting when BOTH barcode and human-readable text appear on the SAME label!)

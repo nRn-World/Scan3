@@ -48,6 +48,10 @@ export function formatSeconds(sec: number): string {
 
 export function humanizeSource(src: string): string {
   if (src === "barcode+ocr") return "Streckkod + Text";
+  if (src.startsWith("barcode:")) {
+    const fmt = src.slice("barcode:".length).trim();
+    return fmt ? `Streckkod (${fmt})` : "Streckkod";
+  }
   if (src.startsWith("barcode")) return "Streckkod";
   if (src === "manual") return "Manuell";
   return "OCR Text";
@@ -446,7 +450,19 @@ export class InventorySessionTracker {
     let hudBanner: HudBannerState | null = null;
 
     for (const det of confirmedDetections) {
-      const cid = det.canonical_id;
+      let cid = det.canonical_id;
+      // If barcode only encoded the numeric tail (e.g. "0615244") and "DEL0615244" is already tracked, merge into "DEL0615244"!
+      if (/^\d{4,16}$/.test(cid) && !this.rowsMap.has(cid)) {
+        for (const knownKey of this.rowsMap.keys()) {
+          if (
+            /^(?:DEL|DLV|REM|RMV|RET)/.test(knownKey) &&
+            knownKey.endsWith(cid)
+          ) {
+            cid = knownKey;
+            break;
+          }
+        }
+      }
       const center = bboxCenter(det.bbox);
       const rememberedCustomer = this.customerMemory.get(cid) || "";
       const fallbackCust = defaultCustomer.trim() || "Okänd kund";

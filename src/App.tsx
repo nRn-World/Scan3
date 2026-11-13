@@ -32,6 +32,7 @@ import { DEFAULT_CUSTOMERS_LIST } from "./lib/labelParser";
 import {
   analyzeFrameLocally,
   LocalEngineStatus,
+  scanBarcodesFastLocally,
   subscribeLocalOcrStatus,
   warmupLocalScanner,
 } from "./lib/localScannerFallback";
@@ -46,6 +47,7 @@ import {
   FrameDetection,
   HudBannerState,
   InventoryRow,
+  PackageCategory,
   SensitivityMode,
 } from "./types";
 
@@ -82,6 +84,11 @@ export const App: React.FC = () => {
     "standard_4col" | "combined_category"
   >("standard_4col");
   const [autoDownloadOnStop, setAutoDownloadOnStop] = useState(true);
+  const [acceptAllBarcodes, setAcceptAllBarcodes] = useState(true);
+  const [defaultBarcodeCategory, setDefaultBarcodeCategory] =
+    useState<PackageCategory>("Delivery");
+  const [cameraZoom, setCameraZoom] = useState<number>(1);
+  const [hardwareZoomActive, setHardwareZoomActive] = useState(false);
 
   // Modals & notifications
   const [showCustomersModal, setShowCustomersModal] = useState(false);
@@ -114,6 +121,7 @@ export const App: React.FC = () => {
   const viewfinderRef = useRef<HTMLDivElement | null>(null);
   const videoElRef = useRef<HTMLVideoElement | null>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const barcodeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const demoCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const isFilmingRef = useRef(false);
@@ -132,6 +140,14 @@ export const App: React.FC = () => {
   knownCustomersRef.current = knownCustomers;
   const autoDownloadRef = useRef(autoDownloadOnStop);
   autoDownloadRef.current = autoDownloadOnStop;
+  const acceptAllBarcodesRef = useRef(acceptAllBarcodes);
+  acceptAllBarcodesRef.current = acceptAllBarcodes;
+  const defaultBarcodeCategoryRef = useRef(defaultBarcodeCategory);
+  defaultBarcodeCategoryRef.current = defaultBarcodeCategory;
+  const cameraZoomRef = useRef(cameraZoom);
+  cameraZoomRef.current = cameraZoom;
+  const hardwareZoomActiveRef = useRef(hardwareZoomActive);
+  hardwareZoomActiveRef.current = hardwareZoomActive;
 
   const triggerToast = useCallback((msg: string) => {
     setToastMessage(msg);
@@ -510,12 +526,13 @@ export const App: React.FC = () => {
 
   /**
    * Draws `<video>` onto `canvas` using the exact `object-cover` crop displayed
-   * inside `viewfinderRef` so mobile portrait cameras stay high-resolution and
-   * bounding boxes align 1:1 with what the user sees on screen.
+   * inside `viewfinderRef` (plus center sensor zoom when hardware zoom isn't active)
+   * so thin 1D barcode bars stay razor-sharp at native camera resolution!
    */
   const drawVideoObjectCoverToCanvas = (
     vid: HTMLVideoElement,
-    canvas: HTMLCanvasElement
+    canvas: HTMLCanvasElement,
+    maxTargetW = 1600
   ): boolean => {
     const vw = vid.videoWidth;
     const vh = vid.videoHeight;
@@ -541,19 +558,64 @@ export const App: React.FC = () => {
       sy = Math.round((vh - sh) / 2);
     }
 
-    const maxTargetW = 1024;
+    // Apply lossless center-sensor crop zoom if digital zoom fallback is active
+    const softZoom = hardwareZoomActiveRef.current
+      ? 1
+      : Math.max(1, cameraZoomRef.current);
+    if (softZoom > 1.01) {
+      const zw = Math.round(sw / softZoom);
+      const zh = Math.round(sh / softZoom);
+      sx = sx + Math.round((sw - zw) / 2);
+      sy = sy + Math.round((sh - zh) / 2);
+      sw = Math.max(160, zw);
+      sh = Math.max(120, zh);
+    }
+
     const scale = sw > maxTargetW ? maxTargetW / sw : 1.0;
     canvas.width = Math.max(320, Math.round(sw * scale));
     canvas.height = Math.max(240, Math.round(sh * scale));
 
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) return false;
+    ctx.imageSmoothingEnabled = scale < 1;
     ctx.drawImage(vid, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
     return true;
   };
 
+  const applyCameraZoom = async (targetZoom: number) => {
+    setCameraZoom(targetZoom);
+    cameraZoomRef.current = targetZoom;
+    const stream = mediaStreamRef.current;
+    const track = stream?.getVideoTracks()?.[0];
+    if (!track || !("getCapabilities" in track)) {
+      setHardwareZoomActive(false);
+      return;
+    }
+    try {
+      const caps = track.getCapabilities() as MediaTrackCapabilities & {
+        zoom?: { min: number; max: number };
+      };
+      if (caps?.zoom && typeof caps.zoom.max === "number" && caps.zoom.max > 1) {
+        const clamped = Math.min(
+          caps.zoom.max,
+          Math.max(caps.zoom.min ?? 1, targetZoom)
+        );
+        await track.applyConstraints({
+          advanced: [{ zoom: clamped } as unknown as MediaTrackConstraintSet],
+        });
+        setHardwareZoomActive(true);
+        hardwareZoomActiveRef.current = true;
+        return;
+      }
+    } catch {
+      // Fall back to center-sensor crop zoom
+    }
+    setHardwareZoomActive(false);
+    hardwareZoomActiveRef.current = false;
+  };
+
   // -------------------------------------------------------------------------
-  // MODE 1: LIVE CAMERA (Mobile rear camera with continuous autofocus + OCR)
+  // MODE 1: LIVE CAMERA (16 FPS Full-HD ZXing-WASM Barcode + Parallel OCR)
   // -------------------------------------------------------------------------
   const startLiveCamera = async () => {
     soundEngine.unlock();
@@ -561,6 +623,8 @@ export const App: React.FC = () => {
     setCameraError(null);
     stopAllStreamsOnly();
     setInputMode("camera");
+    setHardwareZoomActive(false);
+    hardwareZoomActiveRef.current = false;
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setCameraError(
@@ -586,6 +650,7 @@ export const App: React.FC = () => {
           const caps = track.getCapabilities() as MediaTrackCapabilities & {
             torch?: boolean;
             focusMode?: string[];
+            zoom?: { min: number; max: number };
           };
           if (caps?.torch) {
             setTorchSupported(true);
@@ -599,6 +664,18 @@ export const App: React.FC = () => {
               });
             } catch {
               // autofocus already managed by OS
+            }
+          }
+          if (cameraZoomRef.current > 1 && caps?.zoom && caps.zoom.max > 1) {
+            try {
+              const clamped = Math.min(caps.zoom.max, cameraZoomRef.current);
+              await track.applyConstraints({
+                advanced: [{ zoom: clamped } as unknown as MediaTrackConstraintSet],
+              });
+              setHardwareZoomActive(true);
+              hardwareZoomActiveRef.current = true;
+            } catch {
+              // fallback to sensor crop
             }
           }
         }
@@ -616,27 +693,61 @@ export const App: React.FC = () => {
       setElapsedSec(0);
       setHudBanner({
         kind: "idle",
-        title: "● SPELAR IN – Håll etiketten i gröna rutan",
+        title: "● SPELAR IN – Rikta mot streckkod eller del.../rem...",
         subtitle:
-          "Läser t.ex. del0615244 och streckkoder automatiskt. Tryck Stoppa för att spara Excel!",
+          "Tips: Använd 1.5x / 2x zoom och håll mobilen ~20 cm från streckkoden för knivskarp fokus!",
       });
 
-      const runCameraLoop = async () => {
+      // LOOP A: High-Speed 16 FPS Full-HD Barcode Scanner (never blocked by OCR!)
+      const runFastBarcodeLoop = async () => {
         while (isFilmingRef.current && videoElRef.current) {
           const vid = videoElRef.current;
           const nowSec = (performance.now() - startTimeMsRef.current) / 1000;
           setElapsedSec(nowSec);
 
           if (vid.readyState >= 2 && vid.videoWidth > 0) {
-            const canvas =
-              captureCanvasRef.current || document.createElement("canvas");
-            captureCanvasRef.current = canvas;
+            const bcCanvas =
+              barcodeCanvasRef.current || document.createElement("canvas");
+            barcodeCanvasRef.current = bcCanvas;
 
-            if (drawVideoObjectCoverToCanvas(vid, canvas)) {
+            // Keep full 1920px sharpness so thin 1D Code128/Code39/EAN bars never blur!
+            if (drawVideoObjectCoverToCanvas(vid, bcCanvas, 1920)) {
+              const fastRes = await scanBarcodesFastLocally(
+                bcCanvas,
+                knownCustomersRef.current,
+                {
+                  acceptAllBarcodes: acceptAllBarcodesRef.current,
+                  defaultCategory: defaultBarcodeCategoryRef.current,
+                }
+              );
+              if (
+                isFilmingRef.current &&
+                (fastRes.detections.length > 0 || fastRes.raw_text_preview)
+              ) {
+                const frameTs =
+                  (performance.now() - startTimeMsRef.current) / 1000;
+                applyAnalyzedFrame(fastRes, frameTs);
+              }
+            }
+          }
+          await new Promise((r) => setTimeout(r, 55));
+        }
+      };
+
+      // LOOP B: Parallel Non-Blocking OCR Scanner for printed `del0615244` & customer text
+      const runBackgroundOcrLoop = async () => {
+        while (isFilmingRef.current && videoElRef.current) {
+          const vid = videoElRef.current;
+          if (vid.readyState >= 2 && vid.videoWidth > 0) {
+            const ocrCanvas =
+              captureCanvasRef.current || document.createElement("canvas");
+            captureCanvasRef.current = ocrCanvas;
+
+            if (drawVideoObjectCoverToCanvas(vid, ocrCanvas, 1080)) {
               let handledByBackend = false;
               if (backendAvailableRef.current !== false) {
                 try {
-                  const dataUrl = canvas.toDataURL("image/jpeg", 0.82);
+                  const dataUrl = ocrCanvas.toDataURL("image/jpeg", 0.84);
                   const res = await fetch("/api/analyze-frame", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
@@ -660,9 +771,13 @@ export const App: React.FC = () => {
 
               if (!handledByBackend && isFilmingRef.current) {
                 const localData = await analyzeFrameLocally(
-                  canvas,
+                  ocrCanvas,
                   knownCustomersRef.current,
-                  FOCUS_BOX
+                  FOCUS_BOX,
+                  {
+                    acceptAllBarcodes: acceptAllBarcodesRef.current,
+                    defaultCategory: defaultBarcodeCategoryRef.current,
+                  }
                 );
                 if (isFilmingRef.current) {
                   const frameTs =
@@ -672,11 +787,12 @@ export const App: React.FC = () => {
               }
             }
           }
-          await new Promise((r) => setTimeout(r, 60));
+          await new Promise((r) => setTimeout(r, 220));
         }
       };
 
-      runCameraLoop();
+      runFastBarcodeLoop();
+      runBackgroundOcrLoop();
     } catch {
       setCameraError(
         "Kunde inte öppna direktkameran (kontrollera kameratillstånd eller använd 'Filma med mobilens kameraapp' här nedanför!)."
@@ -775,9 +891,9 @@ export const App: React.FC = () => {
             : 0;
         setVideoDurationSec(dur);
 
-        const step = 0.28;
+        const step = 0.25;
         const offCanvas = document.createElement("canvas");
-        const maxSide = 1080;
+        const maxSide = 1440;
         const vw = Math.max(320, tempVid.videoWidth || 720);
         const vh = Math.max(240, tempVid.videoHeight || 1280);
         const scale = Math.max(vw, vh) > maxSide ? maxSide / Math.max(vw, vh) : 1;
@@ -811,11 +927,15 @@ export const App: React.FC = () => {
             setElapsedSec(t);
             setVideoProgress(dur > 0 ? Math.min(0.99, t / dur) : 0.5);
 
-            // Scan full recorded frame so labels anywhere in the video are caught!
+            // Scan full recorded frame so labels & barcodes anywhere in the video are caught!
             const localRes = await analyzeFrameLocally(
               offCanvas,
               knownCustomersRef.current,
-              [0.02, 0.05, 0.98, 0.95]
+              [0.02, 0.05, 0.98, 0.95],
+              {
+                acceptAllBarcodes: acceptAllBarcodesRef.current,
+                defaultCategory: defaultBarcodeCategoryRef.current,
+              }
             );
             applyAnalyzedFrame(localRes, t);
           }
@@ -1355,14 +1475,19 @@ export const App: React.FC = () => {
                 {/* Video / Canvas Surface */}
                 <div
                   ref={viewfinderRef}
-                  className="relative aspect-[4/3] w-full bg-slate-950 sm:aspect-[16/10]"
+                  className="relative aspect-[4/3] w-full overflow-hidden bg-slate-950 sm:aspect-[16/10]"
                 >
                   {/* Live Camera Element */}
                   <video
                     ref={videoElRef}
                     playsInline
                     muted
-                    className={`h-full w-full object-cover ${
+                    style={
+                      !hardwareZoomActive && cameraZoom > 1
+                        ? { transform: `scale(${cameraZoom})` }
+                        : undefined
+                    }
+                    className={`h-full w-full object-cover transition-transform duration-150 ${
                       inputMode === "camera" && isFilming ? "block" : "hidden"
                     }`}
                   />
@@ -1520,7 +1645,7 @@ export const App: React.FC = () => {
                         <div className="absolute -bottom-0.5 -right-0.5 h-6 w-6 rounded-br-xl border-b-4 border-r-4 border-emerald-400" />
                       </div>
 
-                      {/* On-Screen Floating Counter Pill (Always visible on mobile without scrolling!) */}
+                      {/* On-Screen Floating Counter Pill + Zoom Controls */}
                       <div className="absolute bottom-9 left-3 right-3 flex flex-wrap items-center justify-between gap-2">
                         <div className="inline-flex items-center gap-2 rounded-xl border border-slate-700/90 bg-slate-950/90 px-3 py-1.5 text-xs font-bold text-white shadow-lg backdrop-blur-sm">
                           <span className="rounded-md bg-emerald-500 px-1.5 py-0.5 text-[11px] font-extrabold text-slate-950 tabular-nums">
@@ -1529,9 +1654,29 @@ export const App: React.FC = () => {
                           <span className="truncate">
                             {lastSavedLabel
                               ? `Senast: ${lastSavedLabel}`
-                              : "Håll etikett i rutan..."}
+                              : "Håll streckkod/etikett i rutan..."}
                           </span>
                         </div>
+
+                        {inputMode === "camera" && (
+                          <div className="pointer-events-auto inline-flex items-center gap-1 rounded-xl border border-slate-700/90 bg-slate-950/90 p-1 shadow-lg backdrop-blur-sm">
+                            {[1, 1.5, 2, 3].map((z) => (
+                              <button
+                                key={z}
+                                type="button"
+                                onClick={() => applyCameraZoom(z)}
+                                className={`rounded-lg px-2 py-1 text-[11px] font-extrabold transition ${
+                                  cameraZoom === z
+                                    ? "bg-emerald-500 text-slate-950"
+                                    : "text-slate-200 hover:bg-slate-800"
+                                }`}
+                                title="Zooma in och håll mobilen ~20 cm från små streckkoder för skarpare autofokus!"
+                              >
+                                {z}x
+                              </button>
+                            ))}
+                          </div>
+                        )}
                       </div>
 
                       {/* Live OCR Text Monitor Strip at very bottom of viewfinder */}
@@ -1664,8 +1809,59 @@ export const App: React.FC = () => {
                 </div>
               </div>
 
-              {/* Quick Customer Chips + Sensitivity Settings */}
+              {/* Barcode Filter + Quick Customer Chips + Sensitivity Settings */}
               <div className="rounded-2xl border border-slate-200 bg-white p-3.5 shadow-sm sm:p-4">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
+                  <div>
+                    <div className="text-xs font-semibold text-slate-700">
+                      Streckkodsläge (Code128, Code39, QR, DataMatrix, EAN, ITF)
+                    </div>
+                    <div className="text-[11px] text-slate-500">
+                      Läser även streckkoder där själva streckkoden saknar prefixet{" "}
+                      <span className="font-mono">del</span>/<span className="font-mono">rem</span>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setAcceptAllBarcodes(true)}
+                      className={`rounded-lg px-2.5 py-1.5 text-xs font-semibold transition ${
+                        acceptAllBarcodes
+                          ? "bg-emerald-600 text-white"
+                          : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                      }`}
+                    >
+                      Alla streckkoder + del/rem
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAcceptAllBarcodes(false)}
+                      className={`rounded-lg px-2.5 py-1.5 text-xs font-semibold transition ${
+                        !acceptAllBarcodes
+                          ? "bg-slate-900 text-white"
+                          : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                      }`}
+                    >
+                      Endast del.../rem...
+                    </button>
+                    {acceptAllBarcodes && (
+                      <select
+                        value={defaultBarcodeCategory}
+                        onChange={(e) =>
+                          setDefaultBarcodeCategory(
+                            e.target.value as PackageCategory
+                          )
+                        }
+                        className="rounded-lg border border-slate-300 bg-slate-50 px-2 py-1.5 text-xs font-semibold text-slate-800"
+                        title="Kategori om streckkoden saknar del/rem-prefix"
+                      >
+                        <option value="Delivery">Standard: Delivery</option>
+                        <option value="Removal">Standard: Removal</option>
+                      </select>
+                    )}
+                  </div>
+                </div>
+
                 <div className="mb-3">
                   <div className="flex items-center justify-between">
                     <label className="text-xs font-semibold text-slate-700">

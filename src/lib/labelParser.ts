@@ -496,3 +496,98 @@ export function extractCustomerFromOcrLines(
   }
   return { customer: "", confidence: 0, source: "none" };
 }
+
+export interface ParsedBarcodeCandidate extends ParsedTrackingCode {
+  isExplicitPrefix: boolean;
+}
+
+const EMBEDDED_BARCODE_PREFIX_RE =
+  /(DELIVERY|REMOVAL|LEVERANS|RETUR|DEL|DLV|REM|RMV|RET)[\s\-_:/#.]*(\d{4,16})/gi;
+
+export function parseBarcodePayloadClient(
+  rawBarcode: string,
+  acceptAllBarcodes = true,
+  defaultCategory: PackageCategory = "Delivery"
+): ParsedBarcodeCandidate[] {
+  // Strip GS1 FNC1 / ASCII control characters often embedded in Code128 / DataMatrix
+  const cleaned = (rawBarcode || "")
+    .replace(/[\x00-\x1F\x7F]+/g, " ")
+    .trim();
+  if (!cleaned) return [];
+
+  // 1. Standard strict DEL/REM parser
+  const direct = parseTrackingTokensClient(cleaned);
+  if (direct.length > 0) {
+    return direct.map((d) => ({ ...d, isExplicitPrefix: true }));
+  }
+
+  // 2. Embedded DEL/REM inside compound barcode strings (e.g. "MS_DEL0615244_01", "(90)DEL0615244", URLs)
+  const embedded = new Map<string, ParsedBarcodeCandidate>();
+  for (const m of cleaned.matchAll(EMBEDDED_BARCODE_PREFIX_RE)) {
+    const rawPref = m[1].toUpperCase();
+    const digits = m[2];
+    let prefUp = "DEL";
+    let prefTitle = "Del";
+    let category: PackageCategory = "Delivery";
+    if (
+      rawPref.startsWith("REM") ||
+      rawPref.startsWith("RMV") ||
+      rawPref.startsWith("RET")
+    ) {
+      category = "Removal";
+      prefUp = rawPref.startsWith("RMV")
+        ? "RMV"
+        : rawPref.startsWith("RET")
+          ? "RET"
+          : "REM";
+      prefTitle =
+        prefUp === "RMV" ? "Rmv" : prefUp === "RET" ? "Ret" : "Rem";
+    } else if (rawPref === "DLV") {
+      prefUp = "DLV";
+      prefTitle = "Dlv";
+    }
+    const cid = `${prefUp}${digits}`;
+    embedded.set(cid, {
+      canonicalId: cid,
+      displayTitle: `${prefTitle}${digits}`,
+      displayUpper: cid,
+      category,
+      digits,
+      isExplicitPrefix: true,
+    });
+  }
+  if (embedded.size > 0) {
+    return Array.from(embedded.values());
+  }
+
+  // 3. General barcode fallback (e.g. barcode contains "0615244" without "del", EAN-13, tracking ID, QR)
+  if (!acceptAllBarcodes) return [];
+
+  // Take primary token if barcode has pipe/newline delimiters
+  let token = cleaned;
+  if (cleaned.includes("|") || cleaned.includes("\n")) {
+    const parts = cleaned
+      .split(/[|\r\n]+/)
+      .map((p) => p.trim())
+      .filter((p) => p.length >= 3);
+    const numLike = parts.find((p) => /\d{4,}/.test(p));
+    token = numLike || parts[0] || cleaned;
+  }
+
+  const compactDisplay = token.replace(/\s+/g, " ").trim().slice(0, 42);
+  const canonical = compactDisplay.replace(/[\s\-_]+/g, "").toUpperCase();
+  if (canonical.length < 3) return [];
+
+  const onlyDigits = canonical.replace(/\D+/g, "");
+  return [
+    {
+      canonicalId: canonical,
+      displayTitle: compactDisplay,
+      displayUpper: canonical,
+      category: defaultCategory,
+      digits: onlyDigits,
+      isExplicitPrefix: false,
+    },
+  ];
+}
+
